@@ -88,9 +88,6 @@ impl TypeIdAnnotatedPtr {
     }
 
     fn dealloc(&self) {
-        // We have laid out the TVarVersionInner object such that the layout is
-        // placed at the start of the object. This means that we can always grab
-        // it, even without knowing for certain what the real type is.
         System.dealloc
             (self.ptr, get_layout_for_type_id_assert_present(self.type_id));
     }
