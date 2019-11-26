@@ -20,15 +20,12 @@ use std::ptr::null_mut;
 // The inner form of a TVarVersion is the type itself plus a pointer to "next".
 // These versions will be, at various stages in their lifetime, inserted into
 // linked lists, and so we provide that extra pointer-width.
-#[derive(Copy)]
-#[derive(Clone)]
 struct TVarVersionInner<GuardedType> {
     next_ptr: Option<NonNull<GuardedType>>,
     inner_struct: GuardedType
 }
 
-#[derive(Copy)]
-#[derive(Clone)]
+#[derive(Copy, Clone)]
 struct TypeIdAnnotatedPtr {
     type_id: TypeId,
     ptr: * mut u8
@@ -61,37 +58,33 @@ fn idempotent_add_type_get_layout_and_id<T: 'static>() -> (TypeId, Layout) {
     // it.
     unsafe {
         let write_lock_guard = id_to_layout_map.write().unwrap();
-        match write_lock_guard.insert(this_type_typeid, this_type_layout) {
-            Some(already_present_result) => {
-                // This is possible because two threads may have simultaneously
-                // read the map and decided that an entry needed to be inserted.
-                // Just check that the item already there is compatible with
-                // what we wanted to insert.
-                assert_eq!(already_present_result, this_type_layout);
-            },
-            None => {
-                // The key was not present, nothing to do.
-            }
-        }
+        let layout_in_map =
+            write_lock_guard
+                .entry(this_type_typeid)
+                .or_insert(this_type_layout);
+        assert_eq!(*layout_in_map, this_type_layout);
     };
     result_pair
 }
 
 fn get_layout_for_type_id_assert_present(typeid: TypeId) -> Layout {
     let read_lock_guard = id_to_layout_map.read().unwrap();
-    *read_lock_guard.get(&typeid).unwrap()
+    read_lock_guard[&typeid]
 }
 
 impl TypeIdAnnotatedPtr {
 
     fn alloc<T: 'static>() -> TypeIdAnnotatedPtr {
-        let (typeid, layout) = idempotent_add_type_get_layout_and_id::<T>();
-        let new_ptr = System.alloc(layout);
-        assert!(new_ptr != null_mut::<u8>());
-        TypeIdAnnotatedPtr {
-            type_id: typeid,
-            ptr: new_ptr
-        }
+        let (type_id, layout) = idempotent_add_type_get_layout_and_id::<T>();
+        let ptr =
+            if layout.size() == 0 {
+                null_mut()
+            } else {
+                let new_ptr = System.alloc(layout);
+                assert!(new_ptr != null_mut::<u8>());
+                new_ptr
+            };
+        TypeIdAnnotatedPtr { type_id, ptr }
     }
 
     fn dealloc(&self) {
@@ -112,11 +105,25 @@ impl TypeIdAnnotatedPtr {
     }
 }
 
-#[derive(Copy)]
-#[derive(Clone)]
+#[derive(Copy, Clone)]
 struct TVarImmVersion<GuardedType: ?Sized> {
     type_erased_inner: TypeIdAnnotatedPtr,
     phantom: PhantomData<GuardedType>
+}
+
+impl<GuardedType: 'static> TVarImmVersion<GuardedType> {
+    fn wrap_inner_version_ptr
+        (inner_version_ptr: NonNull<TVarVersionInner<GuardedType>>)
+        -> TVarImmVersion<GuardedType>
+    {
+        TVarImmVersion {
+            type_erased_inner: TypeIdAnnotatedPtr {
+                ptr: inner_version_ptr.as_ptr() as * mut u8,
+                type_id: TypeId::of::<TVarVersionInner<GuardedType>>()
+            },
+            phantom: PhantomData
+        }
+    }
 }
 
 impl<GuardedType : 'static> Deref for TVarImmVersion<GuardedType> {
@@ -155,7 +162,7 @@ impl<GuardedType: Copy + 'static + ?Sized> TVarShadowVersion<GuardedType> {
         unsafe { *cast_inner_ptr = guarded };
         TVarShadowVersion {
             type_erased_inner: inner_annot_ptr,
-            phantom: PhantomData { }
+            phantom: PhantomData
         }
     }
 
@@ -174,7 +181,7 @@ impl<GuardedType: Copy + 'static + ?Sized> TVarShadowVersion<GuardedType> {
         std::mem::forget(shadow_version);
         TVarImmVersion {
             type_erased_inner: typeid_annotated_shadow_ptr,
-            phantom: PhantomData { }
+            phantom: PhantomData
         }
     }
 }
@@ -226,12 +233,12 @@ impl<GuardedType : Copy + 'static> VersionedTVar<GuardedType> {
                     stale_version_list: AtomicPtr::new(null_mut()),
                     type_id: init_imm_version_annot_ptr.type_id
                 },
-                phantom: PhantomData { }
+                phantom: PhantomData
             };
         result
     }
 
-    fn get_current_canon_ptr(&self) -> NonNull<TVarVersionInner<GuardedType>> {
+    fn get_current_canon_version(&self) -> TVarImmVersion<GuardedType> {
         // null is used to indicate that the canonical version is undergoing an
         // update but is mid-transaction. If we see this, spin until we get a
         // non-null value.
@@ -244,14 +251,16 @@ impl<GuardedType : Copy + 'static> VersionedTVar<GuardedType> {
             current_canon_opt = NonNull::new(current_canon_ptr);
             spin_loop_hint();
         }
-        current_canon_opt.unwrap().cast::<TVarVersionInner<GuardedType>>()
+        let nonnull_cast_inner_version =
+            current_canon_opt.unwrap().cast::<TVarVersionInner<GuardedType>>();
+        TVarImmVersion::wrap_inner_version_ptr(nonnull_cast_inner_version)
     }
 }
 
 // A captured TVar contains the TVar's value at time of capture plus possibly
 // the transaction-local shadow var if the txn has performed a write (or at
 // least prepared to by getting a mutable ref).
-pub struct CapturedTVar<GuardedType : ?Sized> {
+pub struct CapturedTVar<GuardedType: ?Sized> {
     captured_version: TVarImmVersion<GuardedType>,
     shadow_copy: Option<TVarShadowVersion<GuardedType>>
 }
@@ -339,25 +348,18 @@ impl VersionedTransaction {
         (&mut self, tvar: &VersionedTVar<TVarType>) ->
             CapturedTVarRef<TVarType>
     {
-        let nonnull_ptr_to_type_erased_tvar = NonNull::from(&tvar);
-        let index =
-            match
-                self.captured_tvar_cache.entry(nonnull_ptr_to_type_erased_tvar)
-            {
-                Entry::Occupied(cached_captured_entry) =>
-                    cached_captured_entry.index(),
-                Entry::Vacant(cached_vacant_entry) => {
-                    let new_type_erased_captured_tvar =
-                        tvar.capture_current_version();
-                    let new_index = cached_vacant_entry.index();
-                    cached_vacant_entry.insert(new_type_erased_captured_tvar);
-                    new_index
-                }
-            };
+        let nonnull_ptr_to_type_erased_tvar = NonNull::from(tvar);
+        let entry =
+            self.captured_tvar_cache.entry(nonnull_ptr_to_type_erased_tvar);
+        let index = entry.index();
+        entry.or_insert_with(|| CapturedTVar {
+            captured_version: (*tvar).get_current_canon_version(),
+            shadow_copy: None
+        });
         CapturedTVarRef {
             captured_tvar_idx: index,
             transaction: self,
-            phantom: PhantomData { }
+            phantom: PhantomData
         }
     }
 }
