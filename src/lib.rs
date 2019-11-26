@@ -287,8 +287,7 @@ impl<GuardedType: Copy + 'static> CapturedTVar<GuardedType> {
     }
 }
 
-#[derive(Clone)]
-#[derive(Copy)]
+#[derive(Clone, Copy)]
 struct CapturedTVarRef<'txn, GuardedType> {
     captured_tvar_idx: usize,
     transaction: &'txn VersionedTransaction,
