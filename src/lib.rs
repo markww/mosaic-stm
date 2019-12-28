@@ -1119,16 +1119,22 @@ mod tests {
     use std::sync::Condvar;
     use super::*;
 
-    lazy_static! {
-        static ref TVAR_INT1: VersionedTVar<u64> = VersionedTVar::new(5);
-        static ref TVAR_INT2: VersionedTVar<u64> = VersionedTVar::new(7);
+    mod test1_state {
+        use super::*;
+        lazy_static! {
+            pub static ref TVAR_INT1: VersionedTVar<u64> =
+                VersionedTVar::new(5);
+            pub static ref TVAR_INT2: VersionedTVar<u64> =
+                VersionedTVar::new(7);
+        }
     }
 
     // A simple test where one thread alters the state of two tvars and another
     // thread reads that state.
 
     #[test]
-    fn simple_tvar_use() -> Result<(), TxnErrStatus> {
+    fn test1_simple_tvar_use() -> Result<(), TxnErrStatus> {
+        use test1_state::*;
         let thread1 = thread::spawn(|| {
             VersionedTransaction::start_txn(|txn| {
                 let tvar1_key = txn.capture_tvar(&TVAR_INT1)?;
@@ -1165,27 +1171,33 @@ mod tests {
         Ok(())
     }
 
-    lazy_static! {
-        static ref TVAR_INT3: VersionedTVar<u64> = VersionedTVar::new(0);
-        static ref TVAR_INT4: VersionedTVar<u64> = VersionedTVar::new(0);
+    mod test2_state {
+        use super::*;
+        lazy_static! {
+            pub static ref TVAR_INT1: VersionedTVar<u64> =
+                VersionedTVar::new(0);
+            pub static ref TVAR_INT2: VersionedTVar<u64> =
+                VersionedTVar::new(0);
 
-        // These mutexes are to ensure that the threads finish we create below
-        // finish in the order we intend.
-        static ref MUTEX1: Mutex<bool> = Mutex::new(false);
-        static ref MUTEX2: Mutex<bool> = Mutex::new(false);
-        static ref CONDVAR1: Condvar = Condvar::new();
-        static ref CONDVAR2: Condvar = Condvar::new();
+            // These mutexes are to ensure that the threads we create below
+            // finish in the order we intend.
+            pub static ref MUTEX1: Mutex<bool> = Mutex::new(false);
+            pub static ref MUTEX2: Mutex<bool> = Mutex::new(false);
+            pub static ref CONDVAR1: Condvar = Condvar::new();
+            pub static ref CONDVAR2: Condvar = Condvar::new();
+        }
     }
 
     #[test]
-    fn txn_write_conflict() {
+    fn test2_txn_write_conflict() {
+        use test2_state::*;
         let thread1 = thread::spawn(|| {
             VersionedTransaction::start_txn(|txn| {
-                let (tvar3_key, tvar4_key) = {
+                let (tvar1_key, tvar2_key) = {
                     let mut lock1_guard = MUTEX1.lock().unwrap();
                     let key_pair =
-                        (txn.capture_tvar(&TVAR_INT3)?,
-                         txn.capture_tvar(&TVAR_INT4)?);
+                        (txn.capture_tvar(&TVAR_INT1)?,
+                         txn.capture_tvar(&TVAR_INT2)?);
                     *lock1_guard = true;
 
                     // Notify, as we have captured the original state in
@@ -1199,16 +1211,17 @@ mod tests {
                     // Wait until the second thread has completed its
                     // transaction
                     while !*lock2_guard {
-                        lock2_guard = CONDVAR2.wait(lock2_guard).unwrap();
+                        lock2_guard =
+                            CONDVAR2.wait(lock2_guard).unwrap();
                     }
                 }
 
-                tvar3_key.with_captured_tvar_mut(txn, |tvar3_mut|{
-                    *tvar3_mut += 3;
+                tvar1_key.with_captured_tvar_mut(txn, |tvar1_mut|{
+                    *tvar1_mut += 3;
                 });
 
-                tvar4_key.with_captured_tvar_mut(txn, |tvar4_mut|{
-                    *tvar4_mut += 7;
+                tvar2_key.with_captured_tvar_mut(txn, |tvar2_mut|{
+                    *tvar2_mut += 7;
                 });
                 Ok(())
             });
@@ -1222,11 +1235,11 @@ mod tests {
                         lock1_guard = CONDVAR1.wait(lock1_guard).unwrap();
                     }
 
-                    txn.capture_tvar(&TVAR_INT3)?
+                    txn.capture_tvar(&TVAR_INT1)?
                         .with_captured_tvar_mut(txn, |tvar3_mut|{
                             *tvar3_mut = 2;
                         });
-                    txn.capture_tvar(&TVAR_INT4)?
+                    txn.capture_tvar(&TVAR_INT2)?
                         .with_captured_tvar_mut(txn, |tvar4_mut|{
                             *tvar4_mut = 5;
                         });
@@ -1245,15 +1258,121 @@ mod tests {
 
         // Now, after the threads above, check to make sure that the contents of
         // the tvars are as we expect.
-        let (tvar3_result, tvar4_result) =
+        let (tvar1_result, tvar2_result) =
             VersionedTransaction::start_txn(|txn| {
-                Ok((txn.capture_tvar(&TVAR_INT3)?
-                    .with_captured_tvar_ref(txn, |tvar3_ref|{ *tvar3_ref }),
-                 txn.capture_tvar(&TVAR_INT4)?
-                    .with_captured_tvar_ref(txn, |tvar4_ref|{ *tvar4_ref })))
+                Ok((txn.capture_tvar(&TVAR_INT1)?
+                    .with_captured_tvar_ref(txn, |tvar1_ref|{ *tvar1_ref }),
+                 txn.capture_tvar(&TVAR_INT2)?
+                    .with_captured_tvar_ref(txn, |tvar2_ref|{ *tvar2_ref })))
             });
-        assert_eq!(5, tvar3_result);
-        assert_eq!(12, tvar4_result);
+        assert_eq!(5, tvar1_result);
+        assert_eq!(12, tvar2_result);
+    }
+
+    mod test3_state {
+        use super::*;
+        lazy_static! {
+            pub static ref TVAR_INT1: VersionedTVar<u64> =
+                VersionedTVar::new(17);
+            pub static ref TVAR_INT2: VersionedTVar<u64> =
+                VersionedTVar::new(25);
+
+            // These mutexes are to ensure that the threads we create below
+            // finish in the order we intend.
+            pub static ref MUTEX1: Mutex<bool> = Mutex::new(false);
+            pub static ref MUTEX2: Mutex<bool> = Mutex::new(false);
+            pub static ref CONDVAR1: Condvar = Condvar::new();
+            pub static ref CONDVAR2: Condvar = Condvar::new();
+        }
+    }
+
+    // This test tests a very important aspect of this scheme: a transaction
+    // that only reads tvars is not forced to restart by transactions that write
+    // to their captured tvars after their tvars have been captured but before
+    // they have finished. It is correct to allow them to finish, as the read
+    // transaction can be said to have returned an accurate reflection of the
+    // state before the write transaction occured and there are no guarantees
+    // about what order these transactions will occur in anyway.
+    #[test]
+    fn test3_read_txn_does_not_conflict() {
+        use test3_state::*;
+        let thread1 = thread::spawn(|| {
+            let (tvar1_result, tvar2_result) =
+                VersionedTransaction::start_txn(|txn| {
+                    let (tvar1_key, tvar2_key) = {
+                        let mut lock1_guard =
+                            MUTEX1.lock().unwrap();
+                        let key_pair =
+                            (txn.capture_tvar(&TVAR_INT1)?,
+                            txn.capture_tvar(&TVAR_INT2)?);
+                        *lock1_guard = true;
+
+                        // Notify, as we have captured the original state in
+                        // thread1 and have set ourselves up for a conflict.
+                        CONDVAR1.notify_all();
+                        key_pair
+                    };
+
+                    {
+                        let mut lock2_guard =
+                            MUTEX2.lock().unwrap();
+                        // Wait until the second thread has completed its
+                        // transaction
+                        while !*lock2_guard {
+                            lock2_guard =
+                                CONDVAR2.wait(lock2_guard).unwrap();
+                        }
+                    }
+
+                    Ok((tvar1_key.with_captured_tvar_ref
+                        (txn, |tvar1_ref|{ *tvar1_ref }),
+                        tvar2_key.with_captured_tvar_ref
+                            (txn, |tvar2_ref|{ *tvar2_ref })))
+                });
+            assert_eq!(17, tvar1_result);
+            assert_eq!(25, tvar2_result);
+        });
+        let thread2 = thread::spawn(|| {
+            VersionedTransaction::start_txn(|txn| {
+                {
+                    let mut lock1_guard = MUTEX1.lock().unwrap();
+                    while !*lock1_guard {
+                        lock1_guard = CONDVAR1.wait(lock1_guard).unwrap();
+                    }
+
+                    txn.capture_tvar(&TVAR_INT1)?
+                        .with_captured_tvar_mut(txn, |tvar1_mut|{
+                            *tvar1_mut += 1;
+                        });
+                    txn.capture_tvar(&TVAR_INT2)?
+                        .with_captured_tvar_mut(txn, |tvar2_mut|{
+                            *tvar2_mut += 1;
+                        });
+                }
+                Ok(())
+            });
+            // Now that the transaction on thread2 has completed, notify
+            // thread1.
+            let mut lock2_guard = MUTEX2.lock().unwrap();
+            *lock2_guard = true;
+            CONDVAR2.notify_all();
+        });
+
+        thread1.join().unwrap();
+        thread2.join().unwrap();
+
+        // Now, after the threads above, check to make sure that the contents of
+        // the tvars are as we expect.
+        let (tvar5_result, tvar6_result) =
+            VersionedTransaction::start_txn(|txn| {
+                Ok((txn.capture_tvar(&TVAR_INT1)?
+                    .with_captured_tvar_ref(txn, |tvar1_ref|{ *tvar1_ref }),
+                 txn.capture_tvar(&TVAR_INT2)?
+                    .with_captured_tvar_ref(txn, |tvar2_ref|{ *tvar2_ref })))
+            });
+        assert_eq!(18, tvar5_result);
+        assert_eq!(26, tvar6_result);
+
     }
 
 }
