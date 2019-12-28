@@ -1113,6 +1113,10 @@ impl VersionedTransaction {
 mod tests {
 
     use std::thread;
+    use std::sync::Mutex;
+    use std::sync::MutexGuard;
+    use std::sync::LockResult;
+    use std::sync::Condvar;
     use super::*;
 
     lazy_static! {
@@ -1160,4 +1164,96 @@ mod tests {
         thread2.join().ok().unwrap();
         Ok(())
     }
+
+    lazy_static! {
+        static ref TVAR_INT3: VersionedTVar<u64> = VersionedTVar::new(0);
+        static ref TVAR_INT4: VersionedTVar<u64> = VersionedTVar::new(0);
+
+        // These mutexes are to ensure that the threads finish we create below
+        // finish in the order we intend.
+        static ref MUTEX1: Mutex<bool> = Mutex::new(false);
+        static ref MUTEX2: Mutex<bool> = Mutex::new(false);
+        static ref CONDVAR1: Condvar = Condvar::new();
+        static ref CONDVAR2: Condvar = Condvar::new();
+    }
+
+    #[test]
+    fn txn_write_conflict() {
+        let thread1 = thread::spawn(|| {
+            VersionedTransaction::start_txn(|txn| {
+                let (tvar3_key, tvar4_key) = {
+                    let mut lock1_guard = MUTEX1.lock().unwrap();
+                    let key_pair =
+                        (txn.capture_tvar(&TVAR_INT3)?,
+                         txn.capture_tvar(&TVAR_INT4)?);
+                    *lock1_guard = true;
+
+                    // Notify, as we have captured the original state in
+                    // thread1 and have set ourselves up for a conflict.
+                    CONDVAR1.notify_all();
+                    key_pair
+                };
+
+                {
+                    let mut lock2_guard = MUTEX2.lock().unwrap();
+                    // Wait until the second thread has completed its
+                    // transaction
+                    while !*lock2_guard {
+                        lock2_guard = CONDVAR2.wait(lock2_guard).unwrap();
+                    }
+                }
+
+                tvar3_key.with_captured_tvar_mut(txn, |tvar3_mut|{
+                    *tvar3_mut += 3;
+                });
+
+                tvar4_key.with_captured_tvar_mut(txn, |tvar4_mut|{
+                    *tvar4_mut += 7;
+                });
+                Ok(())
+            });
+
+        });
+        let thread2 = thread::spawn(|| {
+            VersionedTransaction::start_txn(|txn| {
+                {
+                    let mut lock1_guard = MUTEX1.lock().unwrap();
+                    while !*lock1_guard {
+                        lock1_guard = CONDVAR1.wait(lock1_guard).unwrap();
+                    }
+
+                    txn.capture_tvar(&TVAR_INT3)?
+                        .with_captured_tvar_mut(txn, |tvar3_mut|{
+                            *tvar3_mut = 2;
+                        });
+                    txn.capture_tvar(&TVAR_INT4)?
+                        .with_captured_tvar_mut(txn, |tvar4_mut|{
+                            *tvar4_mut = 5;
+                        });
+                }
+                Ok(())
+            });
+            // Now that the transaction on thread2 has completed, notify
+            // thread1.
+            let mut lock2_guard = MUTEX2.lock().unwrap();
+            *lock2_guard = true;
+            CONDVAR2.notify_all();
+        });
+
+        thread1.join().unwrap();
+        thread2.join().unwrap();
+
+        // Now, after the threads above, check to make sure that the contents of
+        // the tvars are as we expect.
+        let (tvar3_result, tvar4_result) =
+            VersionedTransaction::start_txn(|txn| {
+                Ok((txn.capture_tvar(&TVAR_INT3)?
+                    .with_captured_tvar_ref(txn, |tvar3_ref|{ *tvar3_ref }),
+                 txn.capture_tvar(&TVAR_INT4)?
+                    .with_captured_tvar_ref(txn, |tvar4_ref|{ *tvar4_ref })))
+            });
+        assert_eq!(5, tvar3_result);
+        assert_eq!(12, tvar4_result);
+    }
+
 }
