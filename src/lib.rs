@@ -277,16 +277,21 @@ impl DynamicInnerTVarPtr {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 struct TVarImmVersion<GuardedType> {
     type_erased_inner: DynamicInnerTVarPtr,
     phantom: PhantomData<GuardedType>
 }
 
-// TVarImmVersion when I derived it, so I had to add this explicitly. It doesn't
-// make sense, so maybe I can get rid of it when another compiler version comes
-// out.
-impl<GuardedType: Clone> Copy for TVarImmVersion<GuardedType> { }
+impl<GuardedType> Clone for TVarImmVersion<GuardedType> {
+    fn clone(&self) -> Self {
+        TVarImmVersion {
+            type_erased_inner: self.type_erased_inner.clone(),
+            phantom: PhantomData
+        }
+    }
+}
+impl<GuardedType> Copy for TVarImmVersion<GuardedType> { }
 
 impl<GuardedType: 'static> TVarImmVersion<GuardedType> {
     fn wrap_inner_version_ptr
@@ -303,6 +308,20 @@ impl<GuardedType: 'static> TVarImmVersion<GuardedType> {
 
     fn get_dyn_inner_version_ptr(&self) -> DynamicInnerTVarPtr {
         self.type_erased_inner
+    }
+}
+
+// A version of Clone specifically for use in cloning versions of a tvar. This
+// is used because there are circumstances in which a type should not be
+// clonable in the traditional sense, but should be able to be cloned within a
+// tvar.
+pub trait TVarVersionClone {
+    fn tvar_version_clone(&self) -> Self;
+}
+
+impl<ClonableType: Clone> TVarVersionClone for ClonableType {
+    fn tvar_version_clone(&self) -> Self {
+        self.clone()
     }
 }
 
@@ -332,7 +351,7 @@ impl<GuardedType: 'static> TVarShadowVersion<GuardedType> {
 
 }
 
-impl<GuardedType: Clone + 'static> TVarShadowVersion<GuardedType> {
+impl<GuardedType: TVarVersionClone + 'static> TVarShadowVersion<GuardedType> {
 
     fn clone_from_imm_version
         (imm_version: TVarImmVersion<GuardedType>) ->
@@ -342,7 +361,7 @@ impl<GuardedType: Clone + 'static> TVarShadowVersion<GuardedType> {
             (imm_version
                 .get_dyn_inner_version_ptr()
                 .get_guarded_ref::<GuardedType>()
-                .clone())
+                .tvar_version_clone())
     }
 }
 
@@ -377,13 +396,20 @@ struct VersionedTVarTypeErasedRef {
     version: u64
 }
 
-#[derive(Clone)]
 struct VersionedTVarRef<GuardedType> {
     type_erased_ref: VersionedTVarTypeErasedRef,
     phantom: PhantomData<GuardedType>
 }
 
-impl<GuardedType: Clone> Copy for VersionedTVarRef<GuardedType> { }
+impl<GuardedType> Clone for VersionedTVarRef<GuardedType> {
+    fn clone(&self) -> Self {
+        VersionedTVarRef {
+            type_erased_ref: self.type_erased_ref.clone(),
+            phantom: PhantomData
+        }
+    }
+}
+impl<GuardedType> Copy for VersionedTVarRef<GuardedType> { }
 
 struct VersionedTVarTypeErased {
     // TVars are never deallocated in the standard sense. They can, however, be
@@ -471,7 +497,7 @@ pub struct VersionedTVar<GuardedType> {
 
 unsafe impl<GuardedType> Send for VersionedTVar<GuardedType> { }
 
-impl<GuardedType : Clone + 'static> VersionedTVar<GuardedType> {
+impl<GuardedType : TVarVersionClone + 'static> VersionedTVar<GuardedType> {
     pub fn new(inner_val: GuardedType) -> VersionedTVar<GuardedType> {
         // To use the same flow of functions that a regular update to the TVar
         // uses, just create a shadow version and turn it into a TVarImmVersion.
@@ -533,7 +559,7 @@ impl VersionedTVarAllocator {
 
     // This is for use in allocating tvars that should have a certain object
     // identity for less than the static lifetime.
-    fn get_new_tvar_ref<GuardedType: Clone + 'static>
+    fn get_new_tvar_ref<GuardedType: TVarVersionClone + 'static>
         (&mut self, contents: GuardedType)
             -> VersionedTVarRef<GuardedType>
     {
@@ -589,11 +615,11 @@ static mut TVAR_ALLOCATOR: VersionedTVarAllocator =
 // small portion of it changed. This TVarCell provides a way for us to modify a
 // field of a large TVar without having to copy the whole thing.
 #[derive(Clone, Copy)]
-pub struct TVarCell<GuardedType: Clone + 'static> {
+pub struct TVarCell<GuardedType: TVarVersionClone + 'static> {
     cell_payload: VersionedTVarRef<GuardedType>
 }
 
-impl<GuardedType: Clone + 'static> TVarCell<GuardedType> {
+impl<GuardedType: TVarVersionClone + 'static> TVarCell<GuardedType> {
     pub fn new(val: GuardedType) -> TVarCell<GuardedType> {
         TVarCell {
             cell_payload: unsafe { TVAR_ALLOCATOR.get_new_tvar_ref(val) }
@@ -670,8 +696,9 @@ impl CapturedTVarTypeErased {
         }
     }
 
-    fn get_shadow_copy_create_if_not_present<GuardedType: Clone + 'static>
-        (&mut self) -> TVarShadowVersion<GuardedType>
+    fn get_shadow_copy_create_if_not_present
+        <GuardedType: TVarVersionClone + 'static>(&mut self)
+            -> TVarShadowVersion<GuardedType>
     {
         match self.get_optional_shadow_copy() {
             Some(already_present_shadow_copy) => already_present_shadow_copy,
@@ -683,7 +710,7 @@ impl CapturedTVarTypeErased {
                         (captured_version
                             .get_dyn_inner_version_ptr()
                             .get_guarded_ref::<GuardedType>()
-                            .clone());
+                            .tvar_version_clone());
                 self.shadow_copy_ptr =
                     Some(new_shadow_version.type_erased_inner.0.ptr);
                 new_shadow_version
@@ -734,8 +761,9 @@ impl CapturedTVarTypeErased {
         }
     }
 
-    fn borrow_mut<'tvar_mut, GuardedType: 'static + Clone> (&mut self)
-        -> CapturedTVarMut<'tvar_mut, GuardedType>
+    fn borrow_mut<'tvar_mut, GuardedType: 'static + TVarVersionClone>
+        (&mut self)
+            -> CapturedTVarMut<'tvar_mut, GuardedType>
     {
         if (self.mut_borrowed.get()) || (self.num_shared_borrows.get() != 0) {
             panic!
@@ -859,7 +887,7 @@ pub struct CapturedTVarCacheKey<'key, GuardedType> {
     phantom_lifetime: PhantomData<&'key ()>
 }
 
-impl<'key, GuardedType: Clone + 'static>
+impl<'key, GuardedType: TVarVersionClone + 'static>
 CapturedTVarCacheKey<'key, GuardedType> {
     fn with_captured_tvar_ref_cell
         <ReturnType, TVarFn: FnOnce(&RefCell<CapturedTVarTypeErased>) -> ReturnType>
@@ -1313,7 +1341,7 @@ impl VersionedTransaction {
 
     // To reduce the amount of code used, capturing a tvar creates a deferred
     // tvar capture and immediately completes it.
-    pub fn capture_tvar<GuardedType: Clone + 'static>
+    pub fn capture_tvar<GuardedType: TVarVersionClone + 'static>
         (&self, tvar: &'static VersionedTVar<GuardedType>)
             -> Result<CapturedTVarCacheKey<GuardedType>, TxnErrStatus>
     {
@@ -1321,7 +1349,7 @@ impl VersionedTransaction {
             (&tvar.inner_type_erased, None)
     }
 
-    pub fn capture_tvar_cell<GuardedType: Clone + 'static>
+    pub fn capture_tvar_cell<GuardedType: TVarVersionClone + 'static>
         (&self, tvar_cell: &TVarCell<GuardedType>)
             -> Result<CapturedTVarCacheKey<GuardedType>, TxnErrStatus>
     {
@@ -1330,7 +1358,8 @@ impl VersionedTransaction {
             (inner_tvar_ref.tvar_ref, Some(inner_tvar_ref.version))
     }
 
-    fn capture_tvar_with_optional_expected_version<GuardedType: Clone + 'static>
+    fn capture_tvar_with_optional_expected_version
+        <GuardedType: TVarVersionClone + 'static>
         (&self,
          tvar: &'static VersionedTVarTypeErased,
          expected_version: Option<u64>)
