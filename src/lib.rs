@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::ptr::NonNull;
 use std::any::TypeId;
+use std::sync::atomic::Ordering;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::Ordering::Release;
@@ -230,6 +231,7 @@ impl DynamicInnerTVarPtr {
     fn alloc<GuardedType: 'static>(new_val: GuardedType)
         -> DynamicInnerTVarPtr
     {
+        assert!(std::mem::align_of::<TVarVersionInner<GuardedType>>() >= 2);
         DynamicInnerTVarPtr {
             0: TypeIdAnnotatedPtr::alloc(TVarVersionInner {
                 timestamp: NON_CANON_TIMESTAMP.clone(),
@@ -365,31 +367,6 @@ impl<GuardedType: TVarVersionClone + 'static> TVarShadowVersion<GuardedType> {
     }
 }
 
-// This special value indicates that the pointer is temporarily reserved for a
-// write commit. This causes new transactions that wish to grab the canonical
-// value to spin.
-const RESERVED_FOR_COMMIT_REPRESENTATIVE: u8 = 0;
-const RESERVED_FOR_COMMIT_PTR: * const () =
-    (&RESERVED_FOR_COMMIT_REPRESENTATIVE as * const u8) as * const ();
-
-enum TVarCanonPtrContents {
-    ReservedForCommit,
-    Available(NonNull<()>)
-}
-
-impl TVarCanonPtrContents {
-    fn convert_raw_ptr_to_current_version_or_status(raw_ptr: * mut ())
-        -> TVarCanonPtrContents
-    {
-        if (raw_ptr as * const ()) == RESERVED_FOR_COMMIT_PTR {
-            TVarCanonPtrContents::ReservedForCommit
-        } else {
-            TVarCanonPtrContents::Available
-                (NonNull::new(raw_ptr).unwrap())
-        }
-    }
-}
-
 #[derive(Copy, Clone)]
 struct VersionedTVarTypeErasedRef {
     tvar_ref: &'static VersionedTVarTypeErased,
@@ -411,6 +388,40 @@ impl<GuardedType> Clone for VersionedTVarRef<GuardedType> {
 }
 impl<GuardedType> Copy for VersionedTVarRef<GuardedType> { }
 
+struct CanonPtrAndWriteReserved {
+    canon_ptr: NonNull<()>,
+    write_reserved: bool
+}
+
+impl CanonPtrAndWriteReserved {
+    fn new<Pointee>(pointer: * mut Pointee, write_reserved: bool)
+        -> CanonPtrAndWriteReserved
+    {
+        let canon_ptr_as_int = pointer as u64;
+        // Assert that the bottom bit of the pointer is 0. If this isn't the
+        // case, we can't pack it.
+        assert!(canon_ptr_as_int & 1 == 0);
+
+        CanonPtrAndWriteReserved {
+            canon_ptr: NonNull::new(pointer as * mut ()).unwrap(),
+            write_reserved
+        }
+    }
+
+    fn pack(&self) -> u64 {
+        let canon_ptr_as_int = self.canon_ptr.as_ptr() as u64;
+        // Assert that the bottom bit of the pointer is 0.
+        assert!(canon_ptr_as_int & 1 == 0);
+        canon_ptr_as_int | if self.write_reserved { 1 } else { 0 }
+    }
+
+    fn unpack(packed: u64) -> CanonPtrAndWriteReserved {
+        let write_reserved = (packed & 1) == 1;
+        let canon_ptr = ((packed >> 1) << 1) as * mut ();
+        CanonPtrAndWriteReserved::new(canon_ptr, write_reserved)
+    }
+}
+
 struct VersionedTVarTypeErased {
     // TVars are never deallocated in the standard sense. They can, however, be
     // reused. This means that a pointer to a tvar can always be dereferenced,
@@ -419,15 +430,22 @@ struct VersionedTVarTypeErased {
     // VersionedTVarPointer, allowing us to check for liveness without doing
     // reference counting.
     version: AtomicU64,
-    canon_ptr: AtomicPtr<()>,
+    packed_canon_ptr: AtomicU64,
     stale_version_list: AtomicPtr<()>,
     type_id: TypeId,
     free_list_next: AtomicPtr<VersionedTVarTypeErased>
 }
 
 impl VersionedTVarTypeErased {
+    fn fetch_and_unpack_canon_ptr
+        (&self, ordering: Ordering) -> CanonPtrAndWriteReserved
+    {
+        let packed_canon_ptr = self.packed_canon_ptr.load(ordering);
+        CanonPtrAndWriteReserved::unpack(packed_canon_ptr)
+    }
+
     fn has_canon_version_ptr(&self, candidate: NonNull<()>) -> bool {
-         NonNull::new(self.canon_ptr.load(Relaxed)).unwrap() == candidate
+        self.fetch_and_unpack_canon_ptr(Relaxed).canon_ptr == candidate
     }
 
     fn borrow(&'static self) -> VersionedTVarTypeErasedRef {
@@ -441,17 +459,19 @@ impl VersionedTVarTypeErased {
 
     // This function gets the current canon version or, if a special status code
     // pointer is in the canon pointer, the status.
-    fn get_current_canon_version_or_status(&self, expected_version: Option<u64>)
-        -> Result<TVarCanonPtrContents, TxnErrStatus>
+    fn get_current_canon_version_and_reserved
+        (&self, expected_tvar_version: Option<u64>)
+        -> Result<CanonPtrAndWriteReserved, TxnErrStatus>
     {
         let initial_version = self.version.load(Acquire);
-        let raw_canon_ptr = self.canon_ptr.load(Acquire);
+        let canon_ptr_and_write_reserved =
+            self.fetch_and_unpack_canon_ptr(Acquire);
         let second_version = self.version.load(Acquire);
 
         if initial_version != second_version {
             return Err(TxnErrStatus { });
         }
-        match expected_version {
+        match expected_tvar_version {
             Some(expected_version_num) => {
                 if expected_version_num != initial_version {
                     return Err(TxnErrStatus { });
@@ -459,35 +479,29 @@ impl VersionedTVarTypeErased {
             },
             None => { }
         }
-        Ok(TVarCanonPtrContents::convert_raw_ptr_to_current_version_or_status
-            (raw_canon_ptr))
+        Ok(canon_ptr_and_write_reserved)
     }
 
-    // This function spins until it gets the current canon version.
     fn get_current_canon_version(&self, expected_version: Option<u64>)
         -> Result<DynamicInnerTVarPtr, TxnErrStatus>
     {
-        // null is used to indicate that the canonical version is undergoing an
-        // update but is mid-transaction. If we see this, spin until we get a
-        // non-null value.
-        loop {
-            match self.get_current_canon_version_or_status(expected_version)? {
-                TVarCanonPtrContents::ReservedForCommit => {
-                    spin_loop_hint();
-                    continue;
-                },
-                TVarCanonPtrContents::Available(ptr) => {
-                    let type_id_annot_ptr =
-                        TypeIdAnnotatedPtr { ptr, type_id: self.type_id };
-                    let dynamic_inner_version_ptr = DynamicInnerTVarPtr {
-                        0: type_id_annot_ptr
-                    };
-                    return Ok(dynamic_inner_version_ptr)
-                }
-            }
-        }
+        let canon_ptr_and_write_reserved =
+            self.get_current_canon_version_and_reserved(expected_version)?;
+
+        let type_id_annot_ptr =
+            TypeIdAnnotatedPtr {
+                ptr: canon_ptr_and_write_reserved.canon_ptr,
+                type_id: self.type_id };
+        let dynamic_inner_version_ptr = DynamicInnerTVarPtr {
+            0: type_id_annot_ptr
+        };
+        return Ok(dynamic_inner_version_ptr)
     }
 
+    fn clear_write_reservation(&self) {
+        let all_bits_except_bottom: u64 = !1;
+        self.packed_canon_ptr.fetch_and(all_bits_except_bottom, Relaxed);
+    }
 }
 
 pub struct VersionedTVar<GuardedType> {
@@ -515,12 +529,14 @@ impl<GuardedType : TVarVersionClone + 'static> VersionedTVar<GuardedType> {
         }
 
         let init_dynamic_inner_version_ptr = init_type_erased_inner;
+        let canon_ptr_and_write_reserved =
+            CanonPtrAndWriteReserved::new
+                (init_dynamic_inner_version_ptr.0.ptr.as_ptr(), false);
         let result: VersionedTVar<GuardedType> =
             VersionedTVar {
                 inner_type_erased: VersionedTVarTypeErased {
-                    canon_ptr:
-                        AtomicPtr::new
-                            (init_dynamic_inner_version_ptr.0.ptr.as_ptr()),
+                    packed_canon_ptr:
+                        AtomicU64::new(canon_ptr_and_write_reserved.pack()),
                     stale_version_list: AtomicPtr::new(null_mut()),
                     type_id: init_dynamic_inner_version_ptr.0.type_id,
                     version: AtomicU64::new(0),
@@ -1123,17 +1139,21 @@ impl VersionedTransaction {
             let expected_canon_ptr =
                 captured_tvar.borrow().captured_version_ptr.as_ptr();
             let tvar_ref = unsafe {&mut (*tvar_ptr.as_ptr()) };
+            let unreserved_canon_ptr =
+                CanonPtrAndWriteReserved::new(expected_canon_ptr, false);
+            let reserved_canon_ptr =
+                CanonPtrAndWriteReserved::new(expected_canon_ptr, true);
             'cmp_ex_loop: loop {
                 // We are swapping in a marker pointer with no contents,
                 // and whether we fail or succeed, we care only about
                 // the pointer values, not any associated data. I think
                 // we can get away with Relaxed ordering here.
                 let cmp_ex_result =
-                    tvar_ref.canon_ptr.compare_exchange_weak
-                        (expected_canon_ptr,
-                        RESERVED_FOR_COMMIT_PTR as * mut (),
-                        Relaxed,
-                        Relaxed);
+                    tvar_ref.packed_canon_ptr.compare_exchange_weak
+                        (unreserved_canon_ptr.pack(),
+                         reserved_canon_ptr.pack(),
+                         Relaxed,
+                         Relaxed);
                 match cmp_ex_result {
                     Ok(_) => {
                         // Remember, this is successful swap *length*, so
@@ -1141,34 +1161,27 @@ impl VersionedTransaction {
                         successful_swap_length = idx + 1;
                         continue 'reserve_commit;
                     },
-                    Err(found_ptr) => {
-                        let curr_version_or_status =
-                            TVarCanonPtrContents::
-                            convert_raw_ptr_to_current_version_or_status
-                            (found_ptr);
-                        match curr_version_or_status {
-                            TVarCanonPtrContents::ReservedForCommit => {
-                                spin_loop_hint();
-                                continue 'cmp_ex_loop;
-                            },
-                            TVarCanonPtrContents::Available
-                                (available_ptr) =>
-                            {
-                                let raw_available_ptr =
-                                    available_ptr.as_ptr();
-                                if raw_available_ptr == expected_canon_ptr {
-                                    // If this is the case, compare
-                                    // exchange weak experienced a
-                                    // spurious failure. Try again.
-                                    continue 'cmp_ex_loop;
-                                } else {
-                                    // We saw another pointer, and have
-                                    // encountered a conflict.
-                                    saw_conflict = true;
-                                    break 'reserve_commit;
-                                }
-                            }
+                    Err(found_packed_ptr) => {
+                        let unpacked_found_ptr =
+                            CanonPtrAndWriteReserved::unpack(found_packed_ptr);
+                        // If the found pointer did not match, another commit
+                        // has beaten us to the punch.
+                        if unpacked_found_ptr.canon_ptr !=
+                             unreserved_canon_ptr.canon_ptr {
+                            saw_conflict = true;
+                            break 'reserve_commit;
                         }
+                        // If the pointers were equal, but the one in the tvar
+                        // has the write reserved flag, another transaction has
+                        // reserved the tvar for writing. Spin til it is
+                        // available. If that is not the case, we have
+                        // encountered a spurious failure and should retry,
+                        // which is the same behavior.
+                        //
+                        // XXX: Should this spin_loop_hint be triggered on
+                        // spurious failures?
+                        spin_loop_hint();
+                        continue 'cmp_ex_loop;
                     }
                 }
             }
@@ -1177,22 +1190,14 @@ impl VersionedTransaction {
         // If we saw a swap failure, we have to put everything back as
         // we found it and roll back the transaction.
         if saw_conflict {
-            for (idx, (tvar_ptr, captured_tvar)) in
+            for (idx, (tvar_ptr, _)) in
                 captured_tvar_cache_mut.iter().enumerate()
             {
                 if idx == successful_swap_length {
                     return false;
                 }
                 let tvar_ref = unsafe {&mut (*tvar_ptr.as_ptr()) };
-                let original_canon_ptr =
-                    captured_tvar.borrow().captured_version_ptr.as_ptr();
-
-                // We can use relaxed here because the original store
-                // that made this canonical in the first place used
-                // Release, so any Acquire load on this location will
-                // get the updated contents from happening-after that
-                // store.
-                tvar_ref.canon_ptr.store(original_canon_ptr, Relaxed);
+                tvar_ref.clear_write_reservation();
             }
             // The above loop should always return false eventually, so this
             // should be unreachable.
@@ -1209,7 +1214,7 @@ impl VersionedTransaction {
         let this_txn_timestamp = TxnTimestamp::new_updating();
 
         // Now we must update all of the tvars we have touched. For those
-        // that we did not modify, we must swap in the old version. For
+        // that we did not modify, we must clear the write reserved bit. For
         // those that we did, we must swap in our shadow version upgraded to
         // a new immutable version.
         for (tvar_ptr, captured_tvar) in captured_tvar_cache_mut.iter() {
@@ -1226,17 +1231,14 @@ impl VersionedTransaction {
 
                     // This is our first time publishing this shadow version
                     // to other threads, so we must use a release ordering.
-                    tvar_ref.canon_ptr.store(raw_shadow_copy_ptr, Release);
+                    tvar_ref
+                        .packed_canon_ptr
+                        .store
+                            (CanonPtrAndWriteReserved::new
+                                (raw_shadow_copy_ptr, false).pack(),
+                             Release)
                 },
-                None => {
-                    // If we are just replacing a pointer that was already
-                    // canonical, we can use a Relaxed ordering to swap it
-                    // in, as the pointed-to contents were already published
-                    // to this point by an earlier release.
-                    tvar_ref.canon_ptr.store
-                        (captured_tvar.borrow().captured_version_ptr.as_ptr(),
-                            Relaxed);
-                }
+                None => tvar_ref.clear_write_reservation()
             }
         }
 
@@ -1631,9 +1633,9 @@ mod tests {
     mod test3_state {
         use super::*;
         lazy_static! {
-            pub static ref TVAR_INT1: VersionedTVar<u64> =
+            pub static ref TVAR_INT1: VersionedTVar<u8> =
                 VersionedTVar::new(17);
-            pub static ref TVAR_INT2: VersionedTVar<u64> =
+            pub static ref TVAR_INT2: VersionedTVar<u8> =
                 VersionedTVar::new(25);
 
             // These mutexes are to ensure that the threads we create below
