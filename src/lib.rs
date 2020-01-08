@@ -49,27 +49,6 @@ const TXN_COUNTER_NON_CANON: u64 = TXN_COUNTER_UPDATING_VAL - 1;
 // reserved value of 0, and thus are smaller than any other timestamp.
 const TXN_COUNTER_INIT: u64 = 0;
 
-#[derive(Clone)]
-struct TxnTimestamp(Arc<AtomicU64>);
-
-impl TxnTimestamp {
-        fn new_updating() -> TxnTimestamp {
-            TxnTimestamp {
-                0: Arc::new(AtomicU64::new(TXN_COUNTER_UPDATING_VAL))
-        }
-    }
-}
-
-lazy_static! {
-    static ref NON_CANON_TIMESTAMP: TxnTimestamp = TxnTimestamp {
-        0: Arc::new(AtomicU64::new(TXN_COUNTER_NON_CANON))
-    };
-
-    static ref INIT_TIMESTAMP: TxnTimestamp = TxnTimestamp {
-        0: Arc::new(AtomicU64::new(TXN_COUNTER_INIT))
-    };
-}
-
 // The inner form of a TVarVersion is the type itself plus a pointer to "next".
 // These versions will be, at various stages in their lifetime, inserted into
 // linked lists, and so we provide that extra pointer-width.
@@ -80,7 +59,7 @@ lazy_static! {
 // TVarVersionInner with a () GuardedType.
 #[repr(C)]
 struct TVarVersionInner<GuardedType> {
-    timestamp: TxnTimestamp,
+    timestamp: AtomicU64,
     next_ptr: * const (),
     inner_struct: GuardedType
 }
@@ -234,7 +213,7 @@ impl DynamicInnerTVarPtr {
         assert!(std::mem::align_of::<TVarVersionInner<GuardedType>>() >= 2);
         DynamicInnerTVarPtr {
             0: TypeIdAnnotatedPtr::alloc(TVarVersionInner {
-                timestamp: NON_CANON_TIMESTAMP.clone(),
+                timestamp: AtomicU64::new(TXN_COUNTER_NON_CANON),
                 next_ptr: null(),
                 inner_struct: new_val
             })
@@ -258,7 +237,7 @@ impl DynamicInnerTVarPtr {
             // This must be an acquire load. We may be loading a version that
             // does not happen-before this transaction, in which case we must
             // acquire to be able to inspect the timestamp that it points to.
-            type_erased_inner_version_ptr.as_ref().timestamp.0.load(Acquire)
+            type_erased_inner_version_ptr.as_ref().timestamp.load(Acquire)
         }
     }
 
@@ -525,7 +504,8 @@ impl<GuardedType : TVarVersionClone + 'static> VersionedTVar<GuardedType> {
                 .downcast_to_inner_version_having_guarded::<GuardedType>();
 
         unsafe {
-            inner_version_ptr.as_mut().timestamp = INIT_TIMESTAMP.clone();
+            inner_version_ptr
+                .as_mut().timestamp.store(TXN_COUNTER_INIT, Relaxed);
         }
 
         let init_dynamic_inner_version_ptr = init_type_erased_inner;
@@ -1208,11 +1188,6 @@ impl VersionedTransaction {
         // guaranteed to succeed.
         self.txn_succeeded = true;
 
-        // Create a timestamp for this transaction, initially with the
-        // UPDATING value. We will fill this in with the actual value once
-        // all txn values have been swapped in.
-        let this_txn_timestamp = TxnTimestamp::new_updating();
-
         // Now we must update all of the tvars we have touched. For those
         // that we did not modify, we must clear the write reserved bit. For
         // those that we did, we must swap in our shadow version upgraded to
@@ -1224,9 +1199,11 @@ impl VersionedTransaction {
                     let raw_shadow_copy_ptr = inner_shadow_copy_ptr.as_ptr();
                     let ptr_to_shadow_copy_header =
                         raw_shadow_copy_ptr as * mut TVarVersionInner<()>;
+                    // Initially, set the timestamp for all new items being
+                    // swapped in to UPDATING.
                     unsafe {
-                        (*ptr_to_shadow_copy_header).timestamp =
-                            this_txn_timestamp.clone();
+                        (*ptr_to_shadow_copy_header)
+                            .timestamp.store(TXN_COUNTER_UPDATING_VAL, Relaxed);
                     }
 
                     // This is our first time publishing this shadow version
@@ -1252,27 +1229,32 @@ impl VersionedTransaction {
         let old_counter_value = TXN_WRITE_TIME.fetch_add(1, Release);
         let this_txn_time_number = old_counter_value + 1;
 
-        // This marks all of the versions we have swapped in with the
-        // current timestamp, completing the commit phase of this
-        // transaction.
-        this_txn_timestamp.0.store(this_txn_time_number, Release);
-
         // Now that we have completed the commit, we still have to
         // perform some cleanup actions. For all captured tvars where we
         // swapped in a new value, we must place the old canonical version
         // on the stale list.
         for (tvar_ptr, captured_tvar) in captured_tvar_cache_mut.drain(..) {
-            // There's nothing to do for captured tvars which did not have a
-            // shadow copy (ie, were not writes.)
-            if captured_tvar.borrow().shadow_copy_ptr.is_none() {
-                continue;
+            let shadow_copy_ptr =
+                match captured_tvar.borrow().shadow_copy_ptr {
+                    Some(shadow_copy_ptr) => shadow_copy_ptr,
+                    // There's nothing to do for captured tvars which did not
+                    // have a shadow copy (ie, were not writes.)
+                    None => { continue; }
+                };
+            // Mark the former shadow copy (now the new canon version) with the
+            // current txn number timestamp.
+            unsafe {
+                shadow_copy_ptr
+                    .cast::<TVarVersionInner<()>>()
+                    .as_mut()
+                    .timestamp
+                    .store(this_txn_time_number, Release);
             }
             // For writes, place the old canon version onto the stale
             // version list.
             let old_canon =
                 captured_tvar.borrow().captured_version_ptr.as_ptr();
             let tvar_ref = unsafe {&mut (*tvar_ptr.as_ptr()) };
-            std::mem::forget(captured_tvar);
             loop {
                 let old_stale_list_head =
                     tvar_ref.stale_version_list.load(Relaxed);
