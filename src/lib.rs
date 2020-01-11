@@ -5,8 +5,8 @@ use std::borrow::Borrow;
 use std::borrow::BorrowMut;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::Mutex;
 use std::ptr::NonNull;
 use std::any::TypeId;
 use std::sync::atomic::Ordering;
@@ -16,10 +16,8 @@ use std::sync::atomic::Ordering::Release;
 use std::sync::atomic::spin_loop_hint;
 use std::marker::PhantomData;
 use std::alloc::Layout;
-use std::alloc::GlobalAlloc;
 use std::collections::HashMap;
 use std::ptr::null_mut;
-use std::ptr::null;
 use lazy_static::lazy_static;
 use std::thread_local;
 use std::cell::RefCell;
@@ -29,12 +27,9 @@ use std::u64::MAX;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::ops::DerefMut;
-
-// We use Jemalloc as an allocator because it does not synchronize on every
-// allocation/deallocation, unlike regular C malloc/free. Jemalloc keeps a
-// thread-local cache of objects, which is very nice for use with our algorithm
-// that attempts to reduce numbers of synchronizations.
-use jemallocator::Jemalloc;
+use crossbeam_epoch::Owned;
+use crossbeam_epoch::Shared;
+use crossbeam_epoch::Guard;
 
 static TXN_WRITE_TIME: AtomicU64 = AtomicU64::new(0);
 
@@ -49,6 +44,23 @@ const TXN_COUNTER_NON_CANON: u64 = TXN_COUNTER_UPDATING_VAL - 1;
 // reserved value of 0, and thus are smaller than any other timestamp.
 const TXN_COUNTER_INIT: u64 = 0;
 
+struct SendSyncPointerWrapper<PointeeType> {
+    ptr: * mut PointeeType
+}
+
+impl<PointeeType> Clone for SendSyncPointerWrapper<PointeeType> {
+    fn clone(&self) -> Self {
+        SendSyncPointerWrapper {
+            ptr: self.ptr
+        }
+    }
+}
+
+impl<PointeeType> Copy for SendSyncPointerWrapper<PointeeType> { }
+
+unsafe impl<PointeeType> Send for SendSyncPointerWrapper<PointeeType> { }
+unsafe impl<PointeeType> Sync for SendSyncPointerWrapper<PointeeType> { }
+
 // The inner form of a TVarVersion is the type itself plus a pointer to "next".
 // These versions will be, at various stages in their lifetime, inserted into
 // linked lists, and so we provide that extra pointer-width.
@@ -60,14 +72,84 @@ const TXN_COUNTER_INIT: u64 = 0;
 #[repr(C)]
 struct TVarVersionInner<GuardedType> {
     timestamp: AtomicU64,
-    next_ptr: * const (),
+    next_ptr: * mut TVarVersionInner<()>,
+    // We will often be referring to these inner versions as
+    // TVarVersionInner<()> due to losing track of types. This is the type id of
+    // the TVarVersionInner<GuardedType>, allowing us to check our work to
+    // prevent confusion and to automatically look up functions associated with
+    // this guarded type (for instance, the destructor).
+    with_guarded_type_id: TypeId,
+    dtor_fn: fn(DynamicInnerTVarPtr),
+    dealloc_fn: fn(DynamicInnerTVarPtr),
     inner_struct: GuardedType
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-struct TypeIdAnnotatedPtr {
-    type_id: TypeId,
-    ptr: NonNull<()>
+fn clean_up_tvar_version_inner<GuardedType: 'static>
+    (untyped_version: DynamicInnerTVarPtr)
+{
+    let opt_typed_version =
+        untyped_version.dynamic_cast_guarded::<GuardedType>();
+    match opt_typed_version {
+        Some(typed_version) => {
+            let mut mut_typed_version = typed_version;
+            unsafe {
+                let payload_ref = &mut mut_typed_version.as_mut().inner_struct;
+                std::ptr::drop_in_place(payload_ref)
+            };
+        },
+        None => {
+            panic!
+                ("Type confusion while trying to clean up a TVarVersionInner!");
+        }
+    }
+}
+
+fn dealloc_tvar_version_inner<GuardedType: 'static>
+    (untyped_version: DynamicInnerTVarPtr)
+{
+    let opt_typed_version =
+        untyped_version.dynamic_cast_guarded::<GuardedType>();
+    match opt_typed_version {
+        Some(typed_version) => {
+            let guard = crossbeam_epoch::pin();
+            unsafe {
+                guard.defer_destroy
+                    (Shared::from
+                        (typed_version.as_ptr()
+                            as * const TVarVersionInner<GuardedType>));
+            }
+        },
+        None => {
+            panic!
+                ("Type confusion while trying to clean up a TVarVersionInner!");
+        }
+    }
+}
+
+impl<GuardedType: 'static> TVarVersionInner<GuardedType> {
+
+    fn new(new_val: GuardedType) -> TVarVersionInner<GuardedType> {
+        TVarVersionInner {
+            timestamp: AtomicU64::new(TXN_COUNTER_NON_CANON),
+            next_ptr: null_mut(),
+            with_guarded_type_id:
+                TypeId::of::<TVarVersionInner<GuardedType>>(),
+            dtor_fn: clean_up_tvar_version_inner::<GuardedType>,
+            dealloc_fn: dealloc_tvar_version_inner::<GuardedType>,
+            inner_struct: new_val
+        }
+    }
+
+    fn alloc(new_val: GuardedType) -> NonNull<TVarVersionInner<GuardedType>> {
+        idempotent_add_version_guarded_type::<GuardedType>();
+        let owned_new_version = Owned::new(TVarVersionInner::new(new_val));
+        let guard = crossbeam_epoch::pin();
+        let shared_new_version = owned_new_version.into_shared(&guard);
+        NonNull::new
+            (shared_new_version.as_raw() as * mut TVarVersionInner<GuardedType>)
+            .unwrap()
+            .cast::<TVarVersionInner<GuardedType>>()
+    }
 }
 
 lazy_static! {
@@ -75,19 +157,16 @@ lazy_static! {
         RwLock<HashMap<TypeId, Layout>> = RwLock::new(HashMap::new());
 }
 
-fn idempotent_add_type_get_layout_and_id<T: 'static>() -> (TypeId, Layout) {
+fn idempotent_add_version_guarded_type<T: 'static>() {
     let this_type_typeid = TypeId::of::<T>();
     let this_type_layout = Layout::new::<T>();
-    // No matter what happens, if this function succeeds we will return these
-    // items.
-    let result_pair = (this_type_typeid, this_type_layout);
     {
         let read_lock_guard = ID_TO_LAYOUT_MAP.read().unwrap();
         let map_lookup_result = read_lock_guard.get(&this_type_typeid);
         match map_lookup_result {
             Some(layout) => {
                 assert_eq!(*layout, this_type_layout);
-                return result_pair;
+                return;
             }
             None => {
                 // Do nothing, we need to add this item using the write lock.
@@ -103,78 +182,27 @@ fn idempotent_add_type_get_layout_and_id<T: 'static>() -> (TypeId, Layout) {
             .entry(this_type_typeid)
             .or_insert(this_type_layout);
     assert_eq!(*layout_in_map, this_type_layout);
-    result_pair
-}
-
-fn get_layout_for_type_id_assert_present(typeid: TypeId) -> Layout {
-    let read_lock_guard = ID_TO_LAYOUT_MAP.read().unwrap();
-    read_lock_guard[&typeid]
-}
-
-// Why have this be u8? Because we want it to take up space in memory and thus
-// have a unique address (I can't find a straight answer indicating whether
-// pointers to zero sized types are guaranteed to have unique addresses or not,
-// so better safe than sorry)
-const ZERO_SIZED_TYPE_REPRESENTATIVE: u8 = 0;
-
-impl TypeIdAnnotatedPtr {
-
-    fn alloc<T: 'static>(new_val: T) -> TypeIdAnnotatedPtr {
-        let (type_id, layout) = idempotent_add_type_get_layout_and_id::<T>();
-        let ptr =
-            if layout.size() == 0 {
-                NonNull::from(&ZERO_SIZED_TYPE_REPRESENTATIVE).cast::<()>()
-            } else {
-                // The layout should have enough space to store a T, otherwise
-                // we are in for an overflow.
-                assert!(layout.size() >= std::mem::size_of::<T>());
-                let new_ptr =
-                    unsafe { Jemalloc.alloc(layout) } as * mut MaybeUninit<T>;
-                assert!(new_ptr != null_mut());
-                unsafe {
-                    *new_ptr = MaybeUninit::new(new_val);
-                }
-                NonNull::new(new_ptr).unwrap().cast::<()>()
-            };
-        TypeIdAnnotatedPtr { type_id, ptr }
-    }
-
-    fn dealloc(&self) {
-        let ptr_to_dealloc = self.ptr.cast::<u8>().as_ptr();
-        if ptr_to_dealloc != &mut ZERO_SIZED_TYPE_REPRESENTATIVE as * mut u8 {
-            unsafe {
-                Jemalloc.dealloc
-                    (self.ptr.cast::<u8>().as_ptr(),
-                    get_layout_for_type_id_assert_present(self.type_id));
-            }
-        }
-    }
-
-    fn dynamic_cast<T: 'static>(self) -> Option<NonNull<T>> {
-        let target_type_id = TypeId::of::<T>();
-        if target_type_id == self.type_id {
-            Some(self.ptr.cast::<T>())
-        } else {
-            None
-        }
-    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
-struct DynamicInnerTVarPtr(TypeIdAnnotatedPtr);
+struct DynamicInnerTVarPtr(NonNull<TVarVersionInner<()>>);
 
 impl DynamicInnerTVarPtr {
-    fn downcast_to_inner_version_having_guarded<GuardedType: 'static>(&self) ->
-        NonNull<TVarVersionInner<GuardedType>>
-    {
-        self.0.dynamic_cast::<TVarVersionInner<GuardedType>>().unwrap()
+
+    fn dynamic_cast_guarded<GuardedType: 'static>(self)
+        -> Option<NonNull<TVarVersionInner<GuardedType>>> {
+        let target_type_id = TypeId::of::<TVarVersionInner<GuardedType>>();
+        if target_type_id == unsafe { self.0.as_ref().with_guarded_type_id } {
+            Some(self.0.cast::<TVarVersionInner<GuardedType>>())
+        } else {
+            None
+        }
     }
 
     fn get_guarded_ref<GuardedType: 'static>(&self) -> &'static GuardedType {
         &(
             unsafe {
-                &*self
-                    .downcast_to_inner_version_having_guarded::<GuardedType>().as_ptr()
+                &*self.dynamic_cast_guarded::<GuardedType>().unwrap().as_ptr()
             }
         ).inner_struct
     }
@@ -185,14 +213,9 @@ impl DynamicInnerTVarPtr {
         &mut (
             unsafe {
                 &mut *self
-                    .downcast_to_inner_version_having_guarded::<GuardedType>().as_ptr()
+                    .dynamic_cast_guarded::<GuardedType>().unwrap().as_ptr()
             }
         ).inner_struct
-    }
-
-    fn get_inner_raw_version_ptr(&self) -> NonNull<()>
-    {
-        self.0.ptr
     }
 
     fn wrap_static_inner_version<GuardedType: 'static>
@@ -200,44 +223,22 @@ impl DynamicInnerTVarPtr {
         -> DynamicInnerTVarPtr
     {
         DynamicInnerTVarPtr {
-            0: TypeIdAnnotatedPtr {
-                ptr: nonnull_inner_version.cast::<()>(),
-                type_id: TypeId::of::<TVarVersionInner<GuardedType>>()
-            }
+            0: nonnull_inner_version.cast::<TVarVersionInner<()>>()
         }
-    }
-
-    fn alloc<GuardedType: 'static>(new_val: GuardedType)
-        -> DynamicInnerTVarPtr
-    {
-        assert!(std::mem::align_of::<TVarVersionInner<GuardedType>>() >= 2);
-        DynamicInnerTVarPtr {
-            0: TypeIdAnnotatedPtr::alloc(TVarVersionInner {
-                timestamp: AtomicU64::new(TXN_COUNTER_NON_CANON),
-                next_ptr: null(),
-                inner_struct: new_val
-            })
-        }
-    }
-
-    fn dealloc(&mut self) {
-        self.0.dealloc()
     }
 
     fn has_guarded_type<GuardedType: 'static>(&self) -> bool {
-        TypeId::of::<TVarVersionInner<GuardedType>>() == self.0.type_id
+        self.dynamic_cast_guarded::<GuardedType>().is_some()
     }
 
     // Gets the timestamp on a pointee. This version just naively returns the
     // value that is present.
     fn get_pointee_timestamp_val(self) -> u64 {
-        let type_erased_inner_version_ptr =
-            self.0.ptr.cast::<TVarVersionInner<()>>();
         unsafe {
             // This must be an acquire load. We may be loading a version that
             // does not happen-before this transaction, in which case we must
             // acquire to be able to inspect the timestamp that it points to.
-            type_erased_inner_version_ptr.as_ref().timestamp.load(Acquire)
+            self.0.as_ref().timestamp.load(Acquire)
         }
     }
 
@@ -256,7 +257,11 @@ impl DynamicInnerTVarPtr {
             }
         }
     }
+
 }
+
+unsafe impl Send for DynamicInnerTVarPtr { }
+unsafe impl Sync for DynamicInnerTVarPtr { }
 
 #[derive(PartialEq, Eq)]
 struct TVarImmVersion<GuardedType> {
@@ -275,18 +280,6 @@ impl<GuardedType> Clone for TVarImmVersion<GuardedType> {
 impl<GuardedType> Copy for TVarImmVersion<GuardedType> { }
 
 impl<GuardedType: 'static> TVarImmVersion<GuardedType> {
-    fn wrap_inner_version_ptr
-        (inner_version_ptr: NonNull<TVarVersionInner<GuardedType>>)
-        -> TVarImmVersion<GuardedType>
-    {
-        TVarImmVersion {
-            type_erased_inner:
-                DynamicInnerTVarPtr::wrap_static_inner_version
-                    (inner_version_ptr),
-            phantom: PhantomData
-        }
-    }
-
     fn get_dyn_inner_version_ptr(&self) -> DynamicInnerTVarPtr {
         self.type_erased_inner
     }
@@ -306,6 +299,182 @@ impl<ClonableType: Clone> TVarVersionClone for ClonableType {
     }
 }
 
+// An allocator for caching TVar versions in such a fashion that they can be
+// re-allocated quickly without synchronization.
+struct TVarVersionAllocator {
+    layout: Layout,
+    // This is the list of objects that are free and ready to serve the layout
+    // indicated.
+    free_list: AtomicPtr<TVarVersionInner<()>>,
+}
+
+impl TVarVersionAllocator {
+    fn new(layout: Layout) -> TVarVersionAllocator {
+        TVarVersionAllocator {
+            layout,
+            free_list: AtomicPtr::new(null_mut())
+        }
+    }
+
+    fn alloc_shadow_version<GuardedType: 'static>(&self, init: GuardedType)
+        -> TVarShadowVersion<GuardedType>
+    {
+        assert!(self.layout.size() >=
+            std::mem::size_of::<TVarVersionInner<GuardedType>>());
+        assert!(self.layout.align() >=
+            std::mem::align_of::<TVarVersionInner<GuardedType>>());
+
+        let mut free_list_head_ptr = self.free_list.load(Acquire);
+        let tvar_ptr = loop {
+            // If the head is equal to null, allocate a new item.
+            if free_list_head_ptr == null_mut() {
+                break TVarVersionInner::alloc(init)
+                    .cast::<TVarVersionInner<()>>();
+            }
+            let free_list_head =
+                unsafe { free_list_head_ptr.as_mut() }.unwrap();
+            // Otherwise, try to grab the current head of the free list.
+            let head_next = free_list_head.next_ptr;
+            let cmp_ex_result =
+                self.free_list.compare_exchange_weak
+                    (free_list_head, head_next, Acquire, Acquire);
+            match cmp_ex_result {
+                Ok(reserved_ptr) => {
+                    let uninit_ptr =
+                        reserved_ptr
+                            as * mut MaybeUninit<TVarVersionInner<GuardedType>>;
+                    let uninit_mut = unsafe { uninit_ptr.as_mut() }.unwrap();
+                    *uninit_mut =
+                        MaybeUninit::new(TVarVersionInner::new(init));
+                    break NonNull::new
+                        (uninit_ptr as * mut TVarVersionInner<()>).unwrap();
+                },
+                Err(seen_head) => {
+                    free_list_head_ptr = seen_head;
+                }
+            }
+        };
+        TVarShadowVersion {
+            type_erased_inner: DynamicInnerTVarPtr {
+                0: tvar_ptr
+            },
+            phantom: PhantomData
+        }
+    }
+
+    fn return_stale_version_pointer(&self, stale_ptr: DynamicInnerTVarPtr) {
+        let dtor_fn = unsafe { stale_ptr.0.as_ref().dtor_fn };
+        dtor_fn(stale_ptr);
+
+        let mut current_free_list_head = self.free_list.load(Relaxed);
+        let mut mut_stale_ptr = stale_ptr;
+        loop {
+            unsafe {
+                mut_stale_ptr.0.as_mut().next_ptr = current_free_list_head;
+            }
+            let cmp_ex_result =
+                self.free_list.compare_exchange_weak
+                    (current_free_list_head,
+                     stale_ptr.0.as_ptr(),
+                     Release,
+                     Relaxed);
+            match cmp_ex_result {
+                Ok(_) => { break; }
+                Err(seen_head) => { current_free_list_head = seen_head; }
+            }
+        }
+    }
+
+    fn return_formerly_canon_pointer
+        (&'static self, returned: DynamicInnerTVarPtr)
+    {
+        // For a formerly canon version, we have to wait until all threads
+        // currently running transactions have finished possibly using this
+        // version before it can be reused.
+        let guard = crossbeam_epoch::pin();
+        guard.defer(move || {
+            self.return_stale_version_pointer(returned);
+        })
+    }
+}
+
+#[derive(PartialEq, Eq, Copy, Clone)]
+struct HashableLayout(Layout);
+
+impl std::hash::Hash for HashableLayout {
+    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        hasher.write_usize(self.0.align());
+        hasher.write_usize(self.0.size());
+    }
+}
+
+// This global allocator map stores a pointer to the allocator to be used for
+// each layout. These allocators are allocated upon the first request of a
+// particular layout and will not be replaced. As such, they will be cached in
+// each thread's transaction state and this will only be consulted the first
+// time a thread needs to allocate an object with a particular layout. Thus, I
+// don't think using a lock here dilutes the lock-free claims of this algorithm.
+lazy_static! {
+    static ref GLOBAL_LAYOUT_TO_ALLOC_MAP:
+        Mutex<
+            HashMap<HashableLayout,
+                    SendSyncPointerWrapper<TVarVersionAllocator>>> =
+            Mutex::new(HashMap::new());
+}
+
+thread_local! {
+    static THREAD_LAYOUT_TO_ALLOC_MAP:
+        RefCell<HashMap<HashableLayout, NonNull<TVarVersionAllocator>>> =
+            RefCell::new(HashMap::new());
+}
+
+fn get_or_create_version_allocator_for_layout(layout: Layout)
+    -> NonNull<TVarVersionAllocator>
+{
+    use std::collections::hash_map::Entry;
+
+    // Make sure everything is aligned to 8 bytes.
+    assert!(layout.align() >= 8);
+
+    let hashable_layout = HashableLayout { 0: layout };
+
+    let thread_local_lookup_result =
+        THREAD_LAYOUT_TO_ALLOC_MAP.with(|alloc_map_key| {
+            alloc_map_key
+                .borrow()
+                .get(&hashable_layout)
+                .map(|found_val_ref|{ *found_val_ref })
+        });
+
+    match thread_local_lookup_result {
+        Some(allocator_ptr) => return allocator_ptr,
+        None => {
+            // We have to look this up in the global map.
+        }
+    }
+
+    // We should only get here the first time a thread tries to get a particular
+    // layout. The thread-local map should handle it otherwise.
+    let mut map_mutex_guard = GLOBAL_LAYOUT_TO_ALLOC_MAP.lock().unwrap();
+    let layout_entry = map_mutex_guard.entry(hashable_layout);
+    let result_ptr = match layout_entry {
+        Entry::Occupied(present_entry) => {
+            NonNull::new(present_entry.get().ptr).unwrap()
+        },
+        Entry::Vacant(vacant_entry) => {
+            let entry_ptr =
+                Box::leak(Box::new(TVarVersionAllocator::new(layout)));
+            vacant_entry.insert(SendSyncPointerWrapper { ptr: entry_ptr });
+            NonNull::new(entry_ptr).unwrap()
+        }
+    };
+
+    THREAD_LAYOUT_TO_ALLOC_MAP.with(|alloc_map_key| {
+        alloc_map_key.borrow_mut().insert(hashable_layout, result_ptr);
+    });
+    result_ptr
+}
+
 // A TVarShadowVersion represents a version of the object that is local to a
 // transaction and which is still mutable. If the transaction fails and
 // restarts, then this version will be dropped. If the transaction succeeds,
@@ -319,76 +488,101 @@ struct TVarShadowVersion<GuardedType> {
 
 impl<GuardedType: 'static> TVarShadowVersion<GuardedType> {
 
-    fn new(guarded: GuardedType) -> TVarShadowVersion<GuardedType> {
-        TVarShadowVersion {
-            type_erased_inner: DynamicInnerTVarPtr::alloc(guarded),
-            phantom: PhantomData
-        }
-    }
-
     fn get_dyn_inner_version_ptr(&self) -> DynamicInnerTVarPtr {
         self.type_erased_inner
     }
 
 }
 
-impl<GuardedType: TVarVersionClone + 'static> TVarShadowVersion<GuardedType> {
-
-    fn clone_from_imm_version
-        (imm_version: TVarImmVersion<GuardedType>) ->
-            TVarShadowVersion<GuardedType>
-    {
-        Self::new
-            (imm_version
-                .get_dyn_inner_version_ptr()
-                .get_guarded_ref::<GuardedType>()
-                .tvar_version_clone())
-    }
-}
-
 #[derive(Copy, Clone)]
 struct VersionedTVarTypeErasedRef {
-    tvar_ref: &'static VersionedTVarTypeErased,
-    version: u64
+    tvar_ptr: SendSyncPointerWrapper<VersionedTVarTypeErased>
 }
 
 struct VersionedTVarRef<GuardedType> {
-    type_erased_ref: VersionedTVarTypeErasedRef,
+    tvar_ref: VersionedTVarTypeErasedRef,
     phantom: PhantomData<GuardedType>
 }
 
 impl<GuardedType> Clone for VersionedTVarRef<GuardedType> {
     fn clone(&self) -> Self {
         VersionedTVarRef {
-            type_erased_ref: self.type_erased_ref.clone(),
+            tvar_ref: self.tvar_ref,
             phantom: PhantomData
         }
     }
 }
+
 impl<GuardedType> Copy for VersionedTVarRef<GuardedType> { }
 
+// This is a ref which owns the tvar version contained within. Once all such
+// refs are dropped, the tvar is freed.
+pub struct SharedTVarRef<GuardedType> {
+    tvar_ref: VersionedTVarRef<GuardedType>
+}
+
+impl<GuardedType> Drop for SharedTVarRef<GuardedType> {
+    fn drop(&mut self) {
+        let tvar_ptr = self.tvar_ref.tvar_ref.tvar_ptr.ptr;
+        if tvar_ptr == null_mut() {
+            return;
+        }
+        let tvar = unsafe { &mut *tvar_ptr };
+        let sub_prior = tvar.refct.fetch_sub(1, Relaxed);
+        assert_ne!(sub_prior, NON_REFCT_TVAR);
+        let new_refct = sub_prior - 1;
+        if new_refct == 0 {
+            let guard = crossbeam_epoch::pin();
+            tvar.retire();
+            let const_ptr =
+                self.tvar_ref.tvar_ref.tvar_ptr.ptr as
+                    * const VersionedTVarTypeErased;
+            let crossbeam_shared_ptr = Shared::from(const_ptr);
+            unsafe {
+                guard.defer_destroy(crossbeam_shared_ptr);
+            }
+        }
+    }
+}
+
+impl<GuardedType> Clone for SharedTVarRef<GuardedType> {
+    fn clone(&self) -> Self {
+        let tvar_ptr = self.tvar_ref.tvar_ref.tvar_ptr.ptr;
+        if tvar_ptr != null_mut() {
+            let tvar = unsafe { &mut *tvar_ptr };
+            let add_prior = tvar.refct.fetch_add(1, Relaxed);
+            assert_ne!(add_prior, NON_REFCT_TVAR);
+            assert_ne!(add_prior, 0);
+        }
+
+        SharedTVarRef {
+            tvar_ref: self.tvar_ref
+        }
+    }
+}
+
 struct CanonPtrAndWriteReserved {
-    canon_ptr: NonNull<()>,
+    canon_ptr: DynamicInnerTVarPtr,
     write_reserved: bool
 }
 
 impl CanonPtrAndWriteReserved {
-    fn new<Pointee>(pointer: * mut Pointee, write_reserved: bool)
+    fn new(dyn_pointer: DynamicInnerTVarPtr, write_reserved: bool)
         -> CanonPtrAndWriteReserved
     {
-        let canon_ptr_as_int = pointer as u64;
+        let canon_ptr_as_int = dyn_pointer.0.as_ptr() as u64;
         // Assert that the bottom bit of the pointer is 0. If this isn't the
         // case, we can't pack it.
         assert!(canon_ptr_as_int & 1 == 0);
 
         CanonPtrAndWriteReserved {
-            canon_ptr: NonNull::new(pointer as * mut ()).unwrap(),
+            canon_ptr: dyn_pointer,
             write_reserved
         }
     }
 
     fn pack(&self) -> u64 {
-        let canon_ptr_as_int = self.canon_ptr.as_ptr() as u64;
+        let canon_ptr_as_int = self.canon_ptr.0.as_ptr() as u64;
         // Assert that the bottom bit of the pointer is 0.
         assert!(canon_ptr_as_int & 1 == 0);
         canon_ptr_as_int | if self.write_reserved { 1 } else { 0 }
@@ -396,90 +590,94 @@ impl CanonPtrAndWriteReserved {
 
     fn unpack(packed: u64) -> CanonPtrAndWriteReserved {
         let write_reserved = (packed & 1) == 1;
-        let canon_ptr = ((packed >> 1) << 1) as * mut ();
+        let canon_raw = ((packed >> 1) << 1) as * mut TVarVersionInner<()>;
+        let canon_nonnull = NonNull::new(canon_raw).unwrap();
+        let canon_ptr =
+            DynamicInnerTVarPtr::wrap_static_inner_version(canon_nonnull);
         CanonPtrAndWriteReserved::new(canon_ptr, write_reserved)
     }
 }
 
+const NON_REFCT_TVAR: u64 = MAX;
+
+const RETIRED_CANON_OBJECT: u8 = 0;
+const RETIRED_CANON_PTR: * const u8 = &RETIRED_CANON_OBJECT as * const u8;
+
 struct VersionedTVarTypeErased {
-    // TVars are never deallocated in the standard sense. They can, however, be
-    // reused. This means that a pointer to a tvar can always be dereferenced,
-    // but the pointer may or may not be to the same object. This version is
-    // incremented upon every "deallocation" of a tvar and is placed upon each
-    // VersionedTVarPointer, allowing us to check for liveness without doing
-    // reference counting.
-    version: AtomicU64,
     packed_canon_ptr: AtomicU64,
-    stale_version_list: AtomicPtr<()>,
-    type_id: TypeId,
-    free_list_next: AtomicPtr<VersionedTVarTypeErased>
+    refct: AtomicU64,
+    allocator: &'static TVarVersionAllocator
 }
 
 impl VersionedTVarTypeErased {
-    fn fetch_and_unpack_canon_ptr
-        (&self, ordering: Ordering) -> CanonPtrAndWriteReserved
-    {
+    fn fetch_and_unpack_canon_ptr(&self, ordering: Ordering)
+            -> CanonPtrAndWriteReserved {
         let packed_canon_ptr = self.packed_canon_ptr.load(ordering);
         CanonPtrAndWriteReserved::unpack(packed_canon_ptr)
     }
 
-    fn has_canon_version_ptr(&self, candidate: NonNull<()>) -> bool {
+    fn has_canon_version_ptr(&self, candidate: DynamicInnerTVarPtr) -> bool {
         self.fetch_and_unpack_canon_ptr(Relaxed).canon_ptr == candidate
     }
 
-    fn borrow(&'static self) -> VersionedTVarTypeErasedRef {
-        VersionedTVarTypeErasedRef {
-            tvar_ref: &self,
-            // XXX: Is acquire necessary here? I think I could get away with
-            // Relaxed.
-            version: self.version.load(Acquire)
-        }
-    }
-
-    // This function gets the current canon version or, if a special status code
-    // pointer is in the canon pointer, the status.
-    fn get_current_canon_version_and_reserved
-        (&self, expected_tvar_version: Option<u64>)
-        -> Result<CanonPtrAndWriteReserved, TxnErrStatus>
-    {
-        let initial_version = self.version.load(Acquire);
+    fn get_current_canon_version(&self) -> DynamicInnerTVarPtr {
         let canon_ptr_and_write_reserved =
             self.fetch_and_unpack_canon_ptr(Acquire);
-        let second_version = self.version.load(Acquire);
 
-        if initial_version != second_version {
-            return Err(TxnErrStatus { });
-        }
-        match expected_tvar_version {
-            Some(expected_version_num) => {
-                if expected_version_num != initial_version {
-                    return Err(TxnErrStatus { });
-                }
-            },
-            None => { }
-        }
-        Ok(canon_ptr_and_write_reserved)
-    }
-
-    fn get_current_canon_version(&self, expected_version: Option<u64>)
-        -> Result<DynamicInnerTVarPtr, TxnErrStatus>
-    {
-        let canon_ptr_and_write_reserved =
-            self.get_current_canon_version_and_reserved(expected_version)?;
-
-        let type_id_annot_ptr =
-            TypeIdAnnotatedPtr {
-                ptr: canon_ptr_and_write_reserved.canon_ptr,
-                type_id: self.type_id };
-        let dynamic_inner_version_ptr = DynamicInnerTVarPtr {
-            0: type_id_annot_ptr
-        };
-        return Ok(dynamic_inner_version_ptr)
+        canon_ptr_and_write_reserved.canon_ptr
     }
 
     fn clear_write_reservation(&self) {
         let all_bits_except_bottom: u64 = !1;
         self.packed_canon_ptr.fetch_and(all_bits_except_bottom, Relaxed);
+    }
+
+    // This is used to prepare a TVar to be deallocated and reused. This
+    // function assumes that the TVar is no longer reachable (or at least that
+    // all threads know that this TVar should no longer be accessed), and thus
+    // the only way to access the contents is through transactions that started
+    // before retire was called. It swaps in a RETIRED marker value as the canon
+    // version and prepares the former canon version to be placed on the free
+    // list. Any transaction that sees this RETIRED marker will restart its
+    // transaction and, if hitting the RETIRED marker a second time, will panic.
+    fn retire(&self) {
+        let former_canon_ptr = {
+            let mut current_packed_canon_ptr =
+                self.packed_canon_ptr.load(Relaxed);
+            loop {
+                let current_canon_ptr =
+                    CanonPtrAndWriteReserved::unpack(current_packed_canon_ptr);
+                // We should not replace a write-reserved canon_ptr, as the
+                // transaction infrastructure expects that the canon value is,
+                // well, reserved. If we were to swap in the RETIRED value, the
+                // currently-running transaction would swap right in over the
+                // top of it. Instead, try to compare and exchange with the
+                // unreserved equivalent. If the writing transaction had to
+                // back off, this may succeed and we can retire the tvar. If
+                // not, we'll get the canon pointer in the failure value and
+                // can just try again.
+                let current_canon_unreserved = CanonPtrAndWriteReserved {
+                    canon_ptr: current_canon_ptr.canon_ptr,
+                    write_reserved: false
+                };
+                let cmp_ex_result =
+                    self.packed_canon_ptr.compare_exchange_weak
+                        (current_canon_unreserved.pack(),
+                        RETIRED_CANON_PTR as u64,
+                        Relaxed,
+                        Relaxed);
+                match cmp_ex_result {
+                    Ok(_) => { break current_canon_unreserved.canon_ptr; }
+                    Err(found_packed_ptr) => {
+                        current_packed_canon_ptr = found_packed_ptr;
+                        spin_loop_hint();
+                        continue;
+                    }
+                }
+            }
+        };
+
+        self.allocator.return_formerly_canon_pointer(former_canon_ptr);
     }
 }
 
@@ -495,13 +693,19 @@ impl<GuardedType : TVarVersionClone + 'static> VersionedTVar<GuardedType> {
         // To use the same flow of functions that a regular update to the TVar
         // uses, just create a shadow version and turn it into a TVarImmVersion.
 
-        let init_shadow_version = TVarShadowVersion::new(inner_val);
+        let allocator_ptr =
+            get_or_create_version_allocator_for_layout
+                (Layout::new::<TVarVersionInner<GuardedType>>());
+
+        let allocator_ref = unsafe { &*allocator_ptr.as_ptr() };
+        let init_shadow_version = allocator_ref.alloc_shadow_version(inner_val);
 
         let init_type_erased_inner = init_shadow_version.type_erased_inner;
 
         let mut inner_version_ptr =
             init_type_erased_inner
-                .downcast_to_inner_version_having_guarded::<GuardedType>();
+                .dynamic_cast_guarded::<GuardedType>()
+                .unwrap();
 
         unsafe {
             inner_version_ptr
@@ -511,122 +715,55 @@ impl<GuardedType : TVarVersionClone + 'static> VersionedTVar<GuardedType> {
         let init_dynamic_inner_version_ptr = init_type_erased_inner;
         let canon_ptr_and_write_reserved =
             CanonPtrAndWriteReserved::new
-                (init_dynamic_inner_version_ptr.0.ptr.as_ptr(), false);
+                (init_dynamic_inner_version_ptr, false);
         let result: VersionedTVar<GuardedType> =
             VersionedTVar {
                 inner_type_erased: VersionedTVarTypeErased {
+                    allocator: allocator_ref,
+                    refct: AtomicU64::new(NON_REFCT_TVAR),
                     packed_canon_ptr:
-                        AtomicU64::new(canon_ptr_and_write_reserved.pack()),
-                    stale_version_list: AtomicPtr::new(null_mut()),
-                    type_id: init_dynamic_inner_version_ptr.0.type_id,
-                    version: AtomicU64::new(0),
-                    free_list_next: AtomicPtr::new(null_mut())
+                        AtomicU64::new(canon_ptr_and_write_reserved.pack())
                 },
                 phantom: PhantomData
             };
         result
     }
 
-    // This function spins until it gets the current canon version.
-    fn get_current_canon_version(&self, expected_version: Option<u64>)
-        -> Result<TVarImmVersion<GuardedType>, TxnErrStatus>
-    {
-        let type_erased_inner =
-            self.inner_type_erased.get_current_canon_version(expected_version)?;
-        Ok(TVarImmVersion { type_erased_inner, phantom: PhantomData })
-    }
+    pub fn new_shared(inner_val: GuardedType) -> SharedTVarRef<GuardedType> {
+        let owned_ptr = Owned::new(VersionedTVar::new(inner_val));
+        // Initially, the refct indicates that this is a non-refcounted tvar.
+        // Update it to make it have a refcount of 1.
+        (*owned_ptr).inner_type_erased.refct.store(1, Relaxed);
+        let guard = crossbeam_epoch::pin();
+        let shared_ptr = owned_ptr.into_shared(&guard);
+        let raw_tvar_ptr = shared_ptr.as_raw();
+        let raw_mut_tvar_ptr = raw_tvar_ptr as * mut VersionedTVar<GuardedType>;
+        let type_erased_inner_ptr =
+            unsafe {
+                &mut ((*raw_mut_tvar_ptr).inner_type_erased)
+                    as * mut VersionedTVarTypeErased
+                };
+        SharedTVarRef {
+            tvar_ref: VersionedTVarRef {
+                tvar_ref: VersionedTVarTypeErasedRef {
+                    tvar_ptr:
+                        SendSyncPointerWrapper { ptr: type_erased_inner_ptr }
+                },
+                phantom: PhantomData
 
-    fn borrow(&'static self) -> VersionedTVarRef<GuardedType> {
-        VersionedTVarRef {
-            type_erased_ref: self.inner_type_erased.borrow(),
-            phantom: PhantomData
+            }
         }
     }
-}
 
-struct VersionedTVarAllocator {
-    unclaimed_tvars: AtomicPtr<VersionedTVarTypeErased>
-}
-
-unsafe impl Send for VersionedTVarAllocator { }
-unsafe impl Sync for VersionedTVarAllocator { }
-
-impl VersionedTVarAllocator {
-
-    // This is for use in allocating tvars that should have a certain object
-    // identity for less than the static lifetime.
-    fn get_new_tvar_ref<GuardedType: TVarVersionClone + 'static>
-        (&mut self, contents: GuardedType)
-            -> VersionedTVarRef<GuardedType>
-    {
-        let mut unclaimed_head_ptr = self.unclaimed_tvars.load(Acquire);
-        let type_erased_versioned_tvar_ref =
-            loop {
-                // If the unclaimed head is null, there are no unclaimed tvars
-                // to be had and we have to allocate a new one.
-                if unclaimed_head_ptr == null_mut() {
-                    // We leak this because we will never delete the tvar. Maybe
-                    // we will attempt to reclaim tvar memory at some point, but
-                    // doing that correctly seems hard.
-                    let new_leaked_tvar =
-                        Box::leak(Box::new(VersionedTVar::new(contents)));
-                    break &(*new_leaked_tvar).inner_type_erased;
-                } else {
-                    let new_head_ptr =
-                        unsafe {
-                            (*unclaimed_head_ptr).free_list_next.load(Relaxed)
-                        };
-                    let cmp_ex_result =
-                        self.unclaimed_tvars.compare_exchange_weak
-                            (unclaimed_head_ptr,
-                             new_head_ptr,
-                             Acquire,
-                             Acquire);
-                    match cmp_ex_result {
-                        Ok(_) => {
-                            break unsafe { &*unclaimed_head_ptr };
-                        }
-                        Err(found_pointer) => {
-                            unclaimed_head_ptr = found_pointer;
-                            spin_loop_hint();
-                            continue;
-                        }
-                    }
-                }
-            };
-        VersionedTVarRef {
-            type_erased_ref: VersionedTVarTypeErasedRef {
-                tvar_ref: type_erased_versioned_tvar_ref,
-                version: type_erased_versioned_tvar_ref.version.load(Relaxed)
-            },
-            phantom: PhantomData
-        }
+    pub fn retire(&self) {
+        self.inner_type_erased.retire();
     }
-}
 
-static mut TVAR_ALLOCATOR: VersionedTVarAllocator =
-    VersionedTVarAllocator { unclaimed_tvars: AtomicPtr::new(null_mut()) };
-
-// It's often quite unfortunate to have to copy a whole structure if only a
-// small portion of it changed. This TVarCell provides a way for us to modify a
-// field of a large TVar without having to copy the whole thing.
-#[derive(Clone, Copy)]
-pub struct TVarCell<GuardedType: TVarVersionClone + 'static> {
-    cell_payload: VersionedTVarRef<GuardedType>
-}
-
-impl<GuardedType: TVarVersionClone + 'static> TVarCell<GuardedType> {
-    pub fn new(val: GuardedType) -> TVarCell<GuardedType> {
-        TVarCell {
-            cell_payload: unsafe { TVAR_ALLOCATOR.get_new_tvar_ref(val) }
-        }
-    }
 }
 
 struct CapturedTVarTypeErased {
-    captured_version_ptr: NonNull<()>,
-    shadow_copy_ptr: Option<NonNull<()>>,
-    type_id: TypeId,
+    captured_version_ptr: DynamicInnerTVarPtr,
+    shadow_copy_ptr: Option<DynamicInnerTVarPtr>,
     // The CapturedTVar acts like a RefCell, but not exactly, because we want to
     // free up the hash map for insertion while borrowing individual cells.
     mut_borrowed: Cell<bool>,
@@ -636,31 +773,26 @@ struct CapturedTVarTypeErased {
 
 impl CapturedTVarTypeErased {
 
-    fn new<GuardedType: 'static> (captured_version: TVarImmVersion<GuardedType>)
+    fn new<GuardedType: 'static>
+        (captured_version: TVarImmVersion<GuardedType>,
+         new_index: CapturedTVarIndex)
         -> CapturedTVarTypeErased
     {
         let dyn_inner_version_ptr =
             captured_version.get_dyn_inner_version_ptr();
         CapturedTVarTypeErased {
-            captured_version_ptr: dyn_inner_version_ptr.0.ptr,
-            type_id: dyn_inner_version_ptr.0.type_id,
+            captured_version_ptr: dyn_inner_version_ptr,
             shadow_copy_ptr: None,
             mut_borrowed: Cell::new(false),
             num_shared_borrows: Cell::new(0),
-            index: INVALID_CAPTURED_TVAR_INDEX
+            index: new_index
         }
     }
 
     fn get_captured_version<GuardedType: 'static>(&self)
          -> TVarImmVersion<GuardedType>
     {
-        let result_dynamic_inner_version_ptr =
-            DynamicInnerTVarPtr {
-                0: TypeIdAnnotatedPtr {
-                    type_id: self.type_id,
-                    ptr: self.captured_version_ptr
-                }
-            };
+        let result_dynamic_inner_version_ptr = self.captured_version_ptr;
         assert!(result_dynamic_inner_version_ptr
             .has_guarded_type::<GuardedType>());
         let result = TVarImmVersion {
@@ -675,16 +807,10 @@ impl CapturedTVarTypeErased {
     {
         match self.shadow_copy_ptr {
             Some(present_shadow_copy_ptr) => {
-                let result_dynamic_inner_version_ptr = DynamicInnerTVarPtr {
-                    0: TypeIdAnnotatedPtr {
-                        ptr: present_shadow_copy_ptr,
-                        type_id: self.type_id
-                    }
-                };
-                assert!(result_dynamic_inner_version_ptr
+                assert!(present_shadow_copy_ptr
                             .has_guarded_type::<GuardedType>());
                 Some(TVarShadowVersion {
-                    type_erased_inner: result_dynamic_inner_version_ptr,
+                    type_erased_inner: present_shadow_copy_ptr,
                     phantom: PhantomData
                 })
             },
@@ -701,32 +827,23 @@ impl CapturedTVarTypeErased {
             None => {
                 let captured_version =
                     self.get_captured_version::<GuardedType>();
+                let tvar_mut_ref = unsafe { self.index.0.as_mut() };
                 let new_shadow_version =
-                    TVarShadowVersion::new
-                        (captured_version
-                            .get_dyn_inner_version_ptr()
-                            .get_guarded_ref::<GuardedType>()
-                            .tvar_version_clone());
+                    tvar_mut_ref
+                        .allocator
+                        .alloc_shadow_version
+                            (captured_version
+                                .get_dyn_inner_version_ptr()
+                                .get_guarded_ref::<GuardedType>()
+                                .tvar_version_clone());
                 self.shadow_copy_ptr =
-                    Some(new_shadow_version.type_erased_inner.0.ptr);
+                    Some(new_shadow_version.type_erased_inner);
                 new_shadow_version
             }
         }
     }
 
     fn discard_shadow_state(&mut self) {
-        let previous_shadow_copy = self.shadow_copy_ptr.take();
-        match previous_shadow_copy {
-            Some(present_shadow_copy) => {
-                TypeIdAnnotatedPtr {
-                    ptr: present_shadow_copy,
-                    type_id: self.type_id
-                }.dealloc();
-            },
-            None => {
-                // Nothing to drop
-            }
-        }
     }
 
     fn borrow<'tvar_ref, GuardedType: 'static>(&self)
@@ -779,10 +896,13 @@ impl CapturedTVarTypeErased {
 }
 
 #[derive(Clone, Copy)]
-struct CapturedTVarIndex(usize);
+struct CapturedTVarIndex(NonNull<VersionedTVarTypeErased>);
 
-const INVALID_CAPTURED_TVAR_INDEX: CapturedTVarIndex =
-    CapturedTVarIndex { 0: std::usize::MAX };
+impl CapturedTVarIndex {
+    fn get_nonnull(&self) -> NonNull<VersionedTVarTypeErased> {
+        self.0
+    }
+}
 
 pub struct CapturedTVarRef<'a, GuardedType> {
     index: CapturedTVarIndex,
@@ -806,15 +926,12 @@ impl<'a, GuardedType> Deref for CapturedTVarRef<'a, GuardedType> {
 impl<'a, GuardedType> Drop for CapturedTVarRef<'a, GuardedType> {
     fn drop(&mut self) {
         PER_THREAD_TXN_STATE.with(|per_thread_txn_state_key|{
-            let per_thread_state_ref =
-                per_thread_txn_state_key.borrow();
+            let mut per_thread_state_ref =
+                per_thread_txn_state_key.borrow_mut();
 
             let captured_tvar_mut =
                 &mut per_thread_state_ref
-                    .captured_tvar_cache
-                    .get_index(self.index.0)
-                    .unwrap()
-                    .1
+                    .captured_tvar_cache[&self.index.get_nonnull()]
                     .borrow_mut();
             assert!(!captured_tvar_mut.mut_borrowed.get());
             let num_shared_borrows =
@@ -860,15 +977,12 @@ impl<'a, GuardedType> DerefMut for CapturedTVarMut<'a, GuardedType> {
 impl<'a, GuardedType> Drop for CapturedTVarMut<'a, GuardedType> {
     fn drop(&mut self) {
         PER_THREAD_TXN_STATE.with(|per_thread_txn_state_key|{
-            let per_thread_state_ref =
-                per_thread_txn_state_key.borrow();
+            let mut per_thread_state_ref =
+                per_thread_txn_state_key.borrow_mut();
 
             let captured_tvar_mut =
                 &mut per_thread_state_ref
-                    .captured_tvar_cache
-                    .get_index(self.index.0)
-                    .unwrap()
-                    .1
+                    .captured_tvar_cache[&self.index.get_nonnull()]
                     .borrow_mut();
             assert!(captured_tvar_mut.num_shared_borrows.get() == 0);
             assert!(captured_tvar_mut.mut_borrowed.get());
@@ -892,12 +1006,9 @@ CapturedTVarCacheKey<'key, GuardedType> {
         PER_THREAD_TXN_STATE.with(|per_thread_state_key| {
             let per_thread_state_ref = per_thread_state_key.borrow();
             let captured_tvar_ref_cell =
-                per_thread_state_ref
-                    .captured_tvar_cache
-                    .get_index(self.cache_index.0)
-                    .unwrap()
-                    .1;
-                tvar_fn(captured_tvar_ref_cell)
+                &per_thread_state_ref
+                    .captured_tvar_cache[&self.cache_index.get_nonnull()];
+            tvar_fn(captured_tvar_ref_cell)
         })
     }
 
@@ -957,16 +1068,29 @@ struct PerThreadTransactionState {
     // Writes at and before this version happened-before this txn, and thus are
     // guaranteed to be consistent. Writes after it, on the other hand, can be
     // skewed, and require a new acquire of the counter.
-    txn_version_acquisition_threshold: u64,
+    txn_version_acquisition_threshold: u64
 }
 
 impl PerThreadTransactionState {
     fn reset_txn_state(&mut self, drop_shadow_versions: bool) {
         if drop_shadow_versions {
-            for (_, captured_tvar_cell) in
+            for (tvar_ptr, captured_tvar_cell) in
                 self.captured_tvar_cache.drain(..)
             {
-                captured_tvar_cell.borrow_mut().discard_shadow_state();
+                let mut mut_captured_tvar = captured_tvar_cell.borrow_mut();
+                let previous_shadow_copy =
+                    mut_captured_tvar.shadow_copy_ptr.take();
+                let mut mut_tvar_ptr = tvar_ptr;
+                match previous_shadow_copy {
+                    Some(present_shadow_copy) => {
+                        unsafe { mut_tvar_ptr.as_mut() }
+                            .allocator
+                            .return_stale_version_pointer(present_shadow_copy);
+                    },
+                    None => {
+                        // Nothing to drop
+                    }
+                }
             }
         } else {
             self.captured_tvar_cache.clear();
@@ -991,7 +1115,7 @@ pub struct TxnErrStatus { }
 
 // This enum is to help in VersionedTransaction's hit_tvar_cache method.
 enum TVarIndexResult<GuardedType> {
-    KnownFreshIndex(usize),
+    KnownFreshIndex,
     MaybeNotFreshContext(TVarImmVersion<GuardedType>, u64)
 }
 
@@ -1001,11 +1125,12 @@ enum TVarIndexResult<GuardedType> {
 // a transaction, the pattern of allowed accesses is actually more intuitive if
 // a user acts as if the transaction state were stored within the
 // VersionedTransaction.
-pub struct VersionedTransaction {
-    txn_succeeded: bool
+pub struct VersionedTransaction<'guard> {
+    txn_succeeded: bool,
+    _epoch_guard: &'guard Guard
 }
 
-impl Drop for VersionedTransaction {
+impl<'guard> Drop for VersionedTransaction<'guard> {
     fn drop(& mut self) {
         // When a transaction has finished, we should always make sure that the
         // per-thread state is cleared.
@@ -1016,7 +1141,7 @@ impl Drop for VersionedTransaction {
     }
 }
 
-impl VersionedTransaction {
+impl<'guard> VersionedTransaction<'guard> {
 
     fn with_per_thread_txn_state_ref
         <ReturnType,
@@ -1040,54 +1165,6 @@ impl VersionedTransaction {
 
     fn make_transaction_error(&self) -> TxnErrStatus {
         TxnErrStatus { }
-    }
-
-    fn perform_txn
-        <UserResult,
-         ThisTxnFn:
-            Fn(&mut VersionedTransaction) -> Result<UserResult, TxnErrStatus>
-        >
-        (&mut self, txn_fn: ThisTxnFn) -> UserResult
-    {
-        loop {
-            self.with_per_thread_txn_state_mut(|per_thread_state_mut| {
-                per_thread_state_mut.reset_txn_state
-                    (true/*should_drop_shadow_versions*/);
-            });
-            let txn_fn_result = txn_fn(self);
-            let user_result =
-                match txn_fn_result {
-                    Ok(ok_result) => {
-                        ok_result
-                    },
-                    Err(_) => {
-                        continue;
-                    }
-                };
-
-            // We have successfully completed the user's function without
-            // hitting any errors. Now we have to perform the commit action.
-            // If this transaction was a read transaction, nothing more to do.
-            let is_write_txn =
-                self.with_per_thread_txn_state_ref
-                    (|per_thread_state_ref| {
-                         *per_thread_state_ref.is_write_txn.borrow()
-                    });
-            if is_write_txn {
-                let commit_succeeded =
-                    PER_THREAD_TXN_STATE.with(|per_thread_state_key| {
-                        self.perform_write_txn_commit
-                            (&mut *per_thread_state_key.borrow_mut())
-                    });
-                if !commit_succeeded {
-                    continue;
-                }
-            } else {
-                self.txn_succeeded = true;
-            }
-
-            return user_result;
-        }
     }
 
     // For a write transaction, commit the changes. Returns whether or not the
@@ -1117,7 +1194,7 @@ impl VersionedTransaction {
                 reserve_for_write_iter.next()
         {
             let expected_canon_ptr =
-                captured_tvar.borrow().captured_version_ptr.as_ptr();
+                captured_tvar.borrow().captured_version_ptr;
             let tvar_ref = unsafe {&mut (*tvar_ptr.as_ptr()) };
             let unreserved_canon_ptr =
                 CanonPtrAndWriteReserved::new(expected_canon_ptr, false);
@@ -1196,13 +1273,11 @@ impl VersionedTransaction {
             let tvar_ref = unsafe {&mut (*tvar_ptr.as_ptr()) };
             match captured_tvar.borrow().shadow_copy_ptr {
                 Some(inner_shadow_copy_ptr) => {
-                    let raw_shadow_copy_ptr = inner_shadow_copy_ptr.as_ptr();
-                    let ptr_to_shadow_copy_header =
-                        raw_shadow_copy_ptr as * mut TVarVersionInner<()>;
+                    let raw_shadow_copy_ptr = inner_shadow_copy_ptr.0.as_ptr();
                     // Initially, set the timestamp for all new items being
                     // swapped in to UPDATING.
                     unsafe {
-                        (*ptr_to_shadow_copy_header)
+                        (*raw_shadow_copy_ptr)
                             .timestamp.store(TXN_COUNTER_UPDATING_VAL, Relaxed);
                     }
 
@@ -1212,7 +1287,7 @@ impl VersionedTransaction {
                         .packed_canon_ptr
                         .store
                             (CanonPtrAndWriteReserved::new
-                                (raw_shadow_copy_ptr, false).pack(),
+                                (inner_shadow_copy_ptr, false).pack(),
                              Release)
                 },
                 None => tvar_ref.clear_write_reservation()
@@ -1234,7 +1309,7 @@ impl VersionedTransaction {
         // swapped in a new value, we must place the old canonical version
         // on the stale list.
         for (tvar_ptr, captured_tvar) in captured_tvar_cache_mut.drain(..) {
-            let shadow_copy_ptr =
+            let mut shadow_copy_ptr =
                 match captured_tvar.borrow().shadow_copy_ptr {
                     Some(shadow_copy_ptr) => shadow_copy_ptr,
                     // There's nothing to do for captured tvars which did not
@@ -1245,44 +1320,16 @@ impl VersionedTransaction {
             // current txn number timestamp.
             unsafe {
                 shadow_copy_ptr
-                    .cast::<TVarVersionInner<()>>()
+                    .0
                     .as_mut()
                     .timestamp
                     .store(this_txn_time_number, Release);
             }
             // For writes, place the old canon version onto the stale
             // version list.
-            let old_canon =
-                captured_tvar.borrow().captured_version_ptr.as_ptr();
+            let old_canon = captured_tvar.borrow().captured_version_ptr;
             let tvar_ref = unsafe {&mut (*tvar_ptr.as_ptr()) };
-            loop {
-                let old_stale_list_head =
-                    tvar_ref.stale_version_list.load(Relaxed);
-                let old_canon_as_unknown_version_inner =
-                    old_canon as * mut TVarVersionInner<()>;
-                unsafe {
-                    (*old_canon_as_unknown_version_inner).next_ptr =
-                        old_stale_list_head;
-                }
-                // Try to place the old canon at the front of the stale
-                // list. We use Release because we want our store for the
-                // next pointer to show up to any future Acquirers. The
-                // failure mode for the load on acquire can be weak,
-                // however, because we don't even look at the pointer we
-                // get back when we fail.
-                let cmp_ex_result =
-                    tvar_ref
-                        .stale_version_list
-                        .compare_exchange_weak
-                            (old_stale_list_head,
-                                old_canon,
-                                Release,
-                                Relaxed);
-                match cmp_ex_result {
-                    Ok(_) => break,
-                    Err(_) => continue
-                }
-            }
+            tvar_ref.allocator.return_formerly_canon_pointer(old_canon);
         }
 
         return true;
@@ -1295,10 +1342,55 @@ impl VersionedTransaction {
         >
         (txn_fn: ThisTxnFn) -> UserResult
     {
-        // A top-level transaction will borrow from the per-thread transaction
-        // state and assume that no other transaction has checked it out.
-        let mut txn = VersionedTransaction { txn_succeeded: false };
-        txn.perform_txn(txn_fn)
+        loop {
+            let guard = crossbeam_epoch::pin();
+            // A top-level transaction will borrow from the per-thread
+            // transaction state and assume that no other transaction has
+            // checked it out.
+            let mut txn =
+                VersionedTransaction {
+                    txn_succeeded: false,
+                    _epoch_guard: &guard
+                };
+
+            txn.with_per_thread_txn_state_mut(|per_thread_state_mut| {
+                per_thread_state_mut.reset_txn_state
+                    (true/*should_drop_shadow_versions*/);
+            });
+            let txn_fn_result = txn_fn(&mut txn);
+            let user_result =
+                match txn_fn_result {
+                    Ok(ok_result) => {
+                        ok_result
+                    },
+                    Err(_) => {
+                        continue;
+                    }
+                };
+
+            // We have successfully completed the user's function without
+            // hitting any errors. Now we have to perform the commit action.
+            // If this transaction was a read transaction, nothing more to do.
+            let is_write_txn =
+                txn.with_per_thread_txn_state_ref
+                    (|per_thread_state_ref| {
+                         *per_thread_state_ref.is_write_txn.borrow()
+                    });
+            if is_write_txn {
+                let commit_succeeded =
+                    PER_THREAD_TXN_STATE.with(|per_thread_state_key| {
+                        txn.perform_write_txn_commit
+                            (&mut *per_thread_state_key.borrow_mut())
+                    });
+                if !commit_succeeded {
+                    continue;
+                }
+            } else {
+                txn.txn_succeeded = true;
+            }
+
+            return user_result;
+        }
     }
 
     // This function checks that all tvars captured by the current transaction
@@ -1323,33 +1415,37 @@ impl VersionedTransaction {
         })
     }
 
-    // To reduce the amount of code used, capturing a tvar creates a deferred
-    // tvar capture and immediately completes it.
-    pub fn capture_tvar<GuardedType: TVarVersionClone + 'static>
-        (&self, tvar: &'static VersionedTVar<GuardedType>)
-            -> Result<CapturedTVarCacheKey<GuardedType>, TxnErrStatus>
-    {
-        self.capture_tvar_with_optional_expected_version
-            (&tvar.inner_type_erased, None)
-    }
-
     pub fn capture_tvar_cell<GuardedType: TVarVersionClone + 'static>
-        (&self, tvar_cell: &TVarCell<GuardedType>)
+        (&self, shared_tvar_ref: &SharedTVarRef<GuardedType>)
             -> Result<CapturedTVarCacheKey<GuardedType>, TxnErrStatus>
     {
-        let inner_tvar_ref = tvar_cell.cell_payload.type_erased_ref;
-        self.capture_tvar_with_optional_expected_version
-            (inner_tvar_ref.tvar_ref, Some(inner_tvar_ref.version))
+        let inner_tvar_ref = &shared_tvar_ref.tvar_ref;
+        self.capture_type_erased_tvar
+            (unsafe {&*inner_tvar_ref.tvar_ref.tvar_ptr.ptr})
     }
 
-    fn capture_tvar_with_optional_expected_version
+    pub fn capture_tvar
         <GuardedType: TVarVersionClone + 'static>
-        (&self,
-         tvar: &'static VersionedTVarTypeErased,
-         expected_version: Option<u64>)
+        (&self, tvar: &VersionedTVar<GuardedType>)
+            -> Result<CapturedTVarCacheKey<GuardedType>, TxnErrStatus>
+    {
+        self.capture_type_erased_tvar(&tvar.inner_type_erased)
+    }
+
+
+    fn capture_type_erased_tvar
+        <GuardedType: TVarVersionClone + 'static>
+        (&self, tvar: &VersionedTVarTypeErased)
             -> Result<CapturedTVarCacheKey<GuardedType>, TxnErrStatus>
     {
         let cache_key = NonNull::from(tvar);
+        let captured_tvar_index = CapturedTVarIndex { 0: cache_key };
+        let success_result =
+            Ok(CapturedTVarCacheKey {
+                    cache_index: captured_tvar_index,
+                    phantom: PhantomData,
+                    phantom_lifetime: PhantomData
+                });
 
         let version_acquisition_threshold =
             self.with_per_thread_txn_state_ref(|per_thread_state_ref|{
@@ -1364,27 +1460,23 @@ impl VersionedTransaction {
                     match captured_tvar_entry
                     {
                     // If the entry is already there, return the known index.
-                    Occupied(present_entry) => {
+                    Occupied(_) => {
                         TVarIndexResult::KnownFreshIndex
-                            (present_entry.index())
                     },
                     Vacant(vacant_entry) => {
                         let versioned_tvar_type_erased =
                             unsafe { cache_key.as_ref() };
                         let current_canon =
                             versioned_tvar_type_erased
-                                .get_current_canon_version(expected_version)?;
+                                .get_current_canon_version();
                         let current_canon_tvar_imm_version = TVarImmVersion {
                             type_erased_inner: current_canon,
                             phantom: PhantomData
                         };
-                        let mut captured_tvar =
+                        let captured_tvar =
                             CapturedTVarTypeErased::new
-                                (current_canon_tvar_imm_version);
-                        let new_entry_idx = vacant_entry.index();
-                        captured_tvar.index =
-                            CapturedTVarIndex { 0: new_entry_idx };
-
+                                (current_canon_tvar_imm_version,
+                                 captured_tvar_index);
                         // The captured tvar we inserted may have a timestamp
                         // that did not happen before the current transaction
                         // start. If that's the case, we need to check that all
@@ -1402,7 +1494,7 @@ impl VersionedTransaction {
                         // entry into the map.
                         if pointee_timestamp <= version_acquisition_threshold {
                             vacant_entry.insert(RefCell::new(captured_tvar));
-                            TVarIndexResult::KnownFreshIndex(new_entry_idx)
+                            TVarIndexResult::KnownFreshIndex
                         } else {
                             // Otherwise, it is not known-fresh. Return the
                             // information that we have to try to get the index
@@ -1416,56 +1508,44 @@ impl VersionedTransaction {
                 Ok(tvar_index_result)
             })?;
 
-        let final_index =
-            match index_lookup_result {
-                TVarIndexResult::KnownFreshIndex(index) => {
-                    index
-                },
-                TVarIndexResult::MaybeNotFreshContext
-                    (current_canon, pointee_timestamp) =>
-                {
-                    // If we reached this point, the timestamp was not at or
-                    // before the acquisition threshold. We must try to update
-                    // our transaction timestamp and check all captured
-                    // versions to ensure that they are current.
-                    let new_acquisition_threshold =
-                        TXN_WRITE_TIME.load(Acquire);
-                    self.with_per_thread_txn_state_mut(
-                        |per_thread_txn_state_mut| {
-                            per_thread_txn_state_mut
-                                .txn_version_acquisition_threshold =
-                                    new_acquisition_threshold;
-                        });
-                    self.check_all_captured_current()?;
-                    assert!(new_acquisition_threshold >= pointee_timestamp);
+        match index_lookup_result {
+            TVarIndexResult::KnownFreshIndex => {
+                success_result
+            },
+            TVarIndexResult::MaybeNotFreshContext
+                (current_canon, pointee_timestamp) =>
+            {
+                // If we reached this point, the timestamp was not at or
+                // before the acquisition threshold. We must try to update
+                // our transaction timestamp and check all captured
+                // versions to ensure that they are current.
+                let new_acquisition_threshold =
+                    TXN_WRITE_TIME.load(Acquire);
+                self.with_per_thread_txn_state_mut(
+                    |per_thread_txn_state_mut| {
+                        per_thread_txn_state_mut
+                            .txn_version_acquisition_threshold =
+                                new_acquisition_threshold;
+                    });
+                self.check_all_captured_current()?;
+                assert!(new_acquisition_threshold >= pointee_timestamp);
 
-                    self.with_per_thread_txn_state_mut
-                        (|per_thread_txn_state_mut| {
-                        let (index, previous_value_expect_none) =
-                            per_thread_txn_state_mut
-                                .captured_tvar_cache
-                                .insert_full
-                                    (cache_key,
-                                     RefCell::new
-                                        (CapturedTVarTypeErased::new
-                                            (current_canon)));
-                        assert!(previous_value_expect_none.is_none());
+                self.with_per_thread_txn_state_mut
+                    (|per_thread_txn_state_mut| {
+                    let previous_value_expect_none =
                         per_thread_txn_state_mut
                             .captured_tvar_cache
-                            .get_index(index)
-                            .unwrap()
-                            .1
-                            .borrow_mut()
-                            .index = CapturedTVarIndex { 0: index };
-                        index
-                    })
-                }
-            };
-        Ok(CapturedTVarCacheKey {
-            cache_index: CapturedTVarIndex(final_index),
-            phantom: PhantomData,
-            phantom_lifetime: PhantomData
-        })
+                            .insert
+                                (cache_key,
+                                    RefCell::new
+                                    (CapturedTVarTypeErased::new
+                                        (current_canon,
+                                            captured_tvar_index)));
+                    assert!(previous_value_expect_none.is_none());
+                    success_result
+                })
+            }
+        }
     }
 }
 
@@ -1523,6 +1603,8 @@ mod tests {
             })
         });
         thread2.join().ok().unwrap();
+        TVAR_INT1.retire();
+        TVAR_INT2.retire();
         Ok(())
     }
 
@@ -1610,6 +1692,9 @@ mod tests {
             });
         assert_eq!(5, tvar1_result);
         assert_eq!(12, tvar2_result);
+
+        TVAR_INT1.retire();
+        TVAR_INT2.retire();
     }
 
     mod test3_state {
@@ -1706,6 +1791,8 @@ mod tests {
         assert_eq!(18, tvar1_result);
         assert_eq!(26, tvar2_result);
 
+        TVAR_INT1.retire();
+        TVAR_INT2.retire();
     }
 
     // This test is a bit more serious. Unlike the other transactions above,
@@ -1715,9 +1802,9 @@ mod tests {
     // be considered dependent upon all prior nodes in the list plus the one
     // that they insert directly before.
 
-    #[derive(Copy, Clone)]
+    #[derive(Clone)]
     pub struct TVarLinkedListNode<PayloadType: Copy + 'static> {
-        next: TVarCell<Option<TVarLinkedListNode<PayloadType>>>,
+        next: SharedTVarRef<Option<TVarLinkedListNode<PayloadType>>>,
         payload: PayloadType
     }
 
@@ -1743,7 +1830,7 @@ mod tests {
 
         let replace_next = {
             let next_ref = captured_next.get_captured_tvar_ref();
-            match *next_ref {
+            match &*next_ref {
                 None => true,
                 Some(node) => {
                     node.payload > num
@@ -1756,7 +1843,7 @@ mod tests {
             *next_mut =
                 Some(TVarLinkedListNode {
                     payload: num,
-                    next: TVarCell::new(*next_mut)
+                    next: VersionedTVar::new_shared(next_mut.clone())
                 });
             return Ok(());
         }
@@ -1765,10 +1852,8 @@ mod tests {
 
         let next_ref: &Option<TVarLinkedListNode<u64>> =
             next_captured_ref.borrow();
-        add_number_to_list_inner
-            (txn,
-             &next_ref.unwrap(),
-             num)
+        let next_node = next_ref.as_ref().unwrap();
+        add_number_to_list_inner(txn, next_node, num)
     }
 
     fn add_number_to_list(num: u64) {
@@ -1782,7 +1867,7 @@ mod tests {
             let insert_at_head = {
                 let list_head_ref =
                     current_node_capture.get_captured_tvar_ref();
-                match *list_head_ref {
+                match &*list_head_ref {
                     Some(present_head_node) =>
                         num < present_head_node.payload,
                     None => true
@@ -1794,7 +1879,8 @@ mod tests {
                 *list_head_mut =
                     Some(TVarLinkedListNode {
                              payload: num,
-                             next: TVarCell::new(*list_head_mut)
+                             next: VersionedTVar::new_shared
+                                (list_head_mut.clone())
                         });
                 return Ok(());
             }
@@ -1808,7 +1894,7 @@ mod tests {
             let head_ref: &Option<TVarLinkedListNode<u64>> =
                 head_captured_ref.borrow();
 
-            add_number_to_list_inner(txn, &head_ref.unwrap(), num)
+            add_number_to_list_inner(txn, &head_ref.as_ref().unwrap(), num)
         })
     }
 
@@ -1829,7 +1915,7 @@ mod tests {
             txn.capture_tvar_cell(&curr_node.next).unwrap();
         let next_val_captured_ref = next_val_cache_key.get_captured_tvar_ref();
         let next_val_ref = next_val_captured_ref.borrow();
-        match *next_val_ref {
+        match next_val_ref {
             None => {
                 println!(" -> _");
                 assert_eq!(9, expected_num);
@@ -1846,7 +1932,7 @@ mod tests {
         VersionedTransaction::start_txn(|txn|{
             let list_head_ref =
                 txn.capture_tvar(&LIST_HEAD)?.get_captured_tvar_ref();
-            let head_node = list_head_ref.unwrap();
+            let head_node = list_head_ref.as_ref().unwrap();
             verify_list_inner(txn, &head_node, 0);
             Ok(())
         })
@@ -1868,6 +1954,8 @@ mod tests {
         // At this point, all of the insertion threads should have finished.
         // Now it should all be sorted.
         verify_linked_list_result();
+
+        test4_state::LIST_HEAD.retire();
     }
 
     mod test5_state {
@@ -1952,6 +2040,8 @@ mod tests {
             });
         assert_eq!(4, tvar1_result);
         assert_eq!(5, tvar2_result);
-    }
 
+        TVAR_INT1.retire();
+        TVAR_INT2.retire();
+    }
 }
