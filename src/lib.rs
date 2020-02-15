@@ -144,7 +144,7 @@ struct TVarVersionHeader {
     // (for instance, the destructor). We can also use this to derive a layout
     // for the whole version, complete with the possible dynamic array contained
     // within.
-    allocator: NonNull<TVarVersionAllocator>,
+    allocator: &'static TVarVersionAllocator,
     payload_type_id: TypeId,
 }
 
@@ -684,19 +684,18 @@ impl std::hash::Hash for HashableLayout {
 lazy_static! {
     static ref GLOBAL_LAYOUT_TO_ALLOC_MAP:
         Mutex<
-            HashMap<HashableLayout,
-                    SendSyncPointerWrapper<TVarVersionAllocator>>> =
-            Mutex::new(HashMap::new());
+            HashMap<HashableLayout, &'static TVarVersionAllocator>> =
+                Mutex::new(HashMap::new());
 }
 
 thread_local! {
     static THREAD_LAYOUT_TO_ALLOC_MAP:
-        RefCell<HashMap<HashableLayout, NonNull<TVarVersionAllocator>>> =
+        RefCell<HashMap<HashableLayout, &'static TVarVersionAllocator>> =
             RefCell::new(HashMap::new());
 }
 
 fn get_or_create_version_allocator_for_layout(layout: Layout)
-    -> NonNull<TVarVersionAllocator>
+    -> &'static TVarVersionAllocator
 {
     use std::collections::hash_map::Entry;
 
@@ -724,22 +723,22 @@ fn get_or_create_version_allocator_for_layout(layout: Layout)
     // layout. The thread-local map should handle it otherwise.
     let mut map_mutex_guard = GLOBAL_LAYOUT_TO_ALLOC_MAP.lock().unwrap();
     let layout_entry = map_mutex_guard.entry(hashable_layout);
-    let result_ptr = match layout_entry {
+    let result_ref = match layout_entry {
         Entry::Occupied(present_entry) => {
-            NonNull::new(present_entry.get().ptr).unwrap()
+            present_entry.get()
         },
         Entry::Vacant(vacant_entry) => {
-            let entry_ptr =
+            let entry_ref =
                 Box::leak(Box::new(TVarVersionAllocator::new(layout)));
-            vacant_entry.insert(SendSyncPointerWrapper { ptr: entry_ptr });
-            NonNull::new(entry_ptr).unwrap()
+            let insert_result = vacant_entry.insert(entry_ref);
+            *insert_result
         }
     };
 
     THREAD_LAYOUT_TO_ALLOC_MAP.with(|alloc_map_key| {
-        alloc_map_key.borrow_mut().insert(hashable_layout, result_ptr);
+        alloc_map_key.borrow_mut().insert(hashable_layout, result_ref);
     });
-    result_ptr
+    result_ref
 }
 
 // A TVarShadowVersion represents a version of the object that is local to a
@@ -790,12 +789,9 @@ impl TVarShadowVersionTypeErased {
     }
 
     fn return_to_allocator(&self) {
-        unsafe {
-            self.version_ptr.0.as_ref()
-                .allocator.as_ref()
-        }.return_stale_version_pointer
-            (self.version_ptr,
-                Some(self.trailing_array_size));
+        let version_header_ref = unsafe { self.version_ptr.0.as_ref() };
+        version_header_ref.allocator.return_stale_version_pointer
+            (self.version_ptr, Some(self.trailing_array_size));
     }
 }
 
@@ -991,7 +987,7 @@ impl VersionedTVarTypeErased {
         };
 
         let former_canon_ptr_allocator =
-            unsafe { former_canon_ptr.0.as_ref().allocator.as_ref() };
+            unsafe { former_canon_ptr.0.as_ref() }.allocator;
         former_canon_ptr_allocator
             .return_formerly_canon_pointer(former_canon_ptr);
     }
@@ -1051,11 +1047,10 @@ VersionedTVar<Header, ArrayMember> {
         // To use the same flow of functions that a regular update to the TVar
         // uses, just create a shadow version and turn it into a TVarImmVersion.
 
-        let allocator_ptr =
+        let allocator_ref =
             get_or_create_version_allocator_for_layout
                 (TVarVersion::<Header, ArrayMember>::get_layout(0));
 
-        let allocator_ref = unsafe { &*allocator_ptr.as_ptr() };
         let init_shadow_version =
             allocator_ref.alloc_shadow_version
                 (header_init,
@@ -1218,8 +1213,7 @@ impl CapturedTVarCacheEntry {
                     self.get_captured_version::<Header, ArrayMember>();
                 let captured_version_ref =
                     unsafe { captured_version_ptr.0.as_ref() };
-                let allocator_ptr = captured_version_ref.header.allocator;
-                let allocator_ref = unsafe { allocator_ptr.as_ref() };
+                let allocator_ref = captured_version_ref.header.allocator;
                 let dup_shadow_version = allocator_ref
                     .alloc_duplicate_shadow_version(captured_version_ref);
                 self.shadow_copy_ptr = Some(dup_shadow_version.erase_type());
@@ -1281,10 +1275,9 @@ impl CapturedTVarCacheEntry {
             version_mut.payload.header = new_header;
         } else {
             // Otherwise, allocate a new shadow version with the provided size.
-            let allocator_ptr = get_or_create_version_allocator_for_layout
+            let allocator_ref = get_or_create_version_allocator_for_layout
                 (TVarVersion::<Header, ArrayMember>::get_layout
                         (flexible_array_len));
-            let allocator_ref = unsafe { allocator_ptr.as_ref() };
             let version_ptr =
                 self.get_working_version_ptr::<Header, ArrayMember>();
             let flexible_array_len =
@@ -1879,8 +1872,8 @@ impl<'guard> VersionedTransaction<'guard> {
             // For writes, place the old canon version onto the stale
             // version list.
             let old_canon = captured_tvar.borrow().captured_version_ptr;
-            unsafe { old_canon.0.as_ref().allocator.as_ref() }
-                .return_formerly_canon_pointer(old_canon);
+            let old_canon_ref = unsafe { old_canon.0.as_ref() };
+            old_canon_ref.allocator.return_formerly_canon_pointer(old_canon);
         }
 
         return true;
