@@ -1,5 +1,5 @@
 [package]
-name = "vstm"
+name = "mosaic-stm"
 version = "0.1.0"
 authors = ["Mark Winterrowd <markwinterrowd4@gmail.com>"]
 edition = "2018"
