@@ -245,10 +245,11 @@ impl<Header: FlexibleArrayHeader + TVarVersionClone + 'static,
         let version_for_layout =
             get_or_create_version_allocator_for_layout(layout);
         let tvar_version_header = TVarVersionHeader {
-           timestamp: AtomicU64::new(TXN_COUNTER_NON_CANON),
-           next_ptr: null_mut(),
-           allocator: version_for_layout,
-           payload_type_id: TypeId::of::<FlexibleArray<Header, ArrayMember>>(),
+            timestamp: AtomicU64::new(TXN_COUNTER_NON_CANON),
+            next_ptr: null_mut(),
+            allocator: version_for_layout,
+            payload_type_id:
+                idempotent_add_version_payload_type::<Header, ArrayMember>(),
         };
 
         let version_mut =
@@ -338,6 +339,7 @@ thread_local! {
 
 fn idempotent_add_version_payload_type
     <Header: FlexibleArrayHeader + 'static, ArrayMember: 'static>()
+    -> TypeId
 {
     use std::collections::hash_map::Entry;
     let this_type_typeid = TypeId::of::<FlexibleArray<Header, ArrayMember>>();
@@ -362,7 +364,7 @@ fn idempotent_add_version_payload_type
         });
 
     if !new_entry_inserted {
-        return;
+        return this_type_typeid;
     }
 
     // If this was a vacant entry, we have to possibly update the global map
@@ -371,9 +373,10 @@ fn idempotent_add_version_payload_type
         GLOBAL_TYPE_ID_TO_INFO_MAP.lock().unwrap();
     let global_entry = global_map_lock.entry(this_type_typeid);
     match global_entry {
-        Entry::Occupied(_) => { return; }
+        Entry::Occupied(_) => { return  this_type_typeid; }
         Entry::Vacant(vacant_entry) => {
             vacant_entry.insert(new_type_info);
+            return this_type_typeid;
         }
     }
 }
