@@ -42,16 +42,17 @@ use crossbeam_epoch::Guard;
 
 static TXN_WRITE_TIME: AtomicU64 = AtomicU64::new(0);
 
+fn release_writes_and_get_txn_timestamp() -> u64 {
+    let old_counter_value = TXN_WRITE_TIME.fetch_add(1, Release);
+    old_counter_value + 1
+}
+
 // A magic number indicating that the transaction counter is in the middle of
 // updating.
 const TXN_COUNTER_UPDATING_VAL: u64 = MAX;
 // A magic number indicating that this version does not exist at a canonical
 // time. This is the timestamp value on shadow versions.
 const TXN_COUNTER_NON_CANON: u64 = TXN_COUNTER_UPDATING_VAL - 1;
-
-// A timestamp for values resulting from initialization. They are given the
-// reserved value of 0, and thus are smaller than any other timestamp.
-const TXN_COUNTER_INIT: u64 = 0;
 
 struct SendSyncPointerWrapper<PointeeType> {
     ptr: * mut PointeeType
@@ -1067,11 +1068,18 @@ VersionedTVar<Header, ArrayMember> {
 
         let shadow_version_mut = unsafe { shadow_version_nonnull_ptr.as_mut() };
         let shadow_version_header = &mut shadow_version_mut.header;
-        shadow_version_header.timestamp.store(TXN_COUNTER_INIT, Relaxed);
 
         let canon_ptr_and_write_reserved =
             CanonPtrAndWriteReserved::new
                 (shadow_version_ptr.get_header_pointer(), false);
+
+        // If lazy_static! is used to create a VersionedTVar, the initialization
+        // of this tvar can occur at an arbitrary time - possibly after other
+        // transactions have launched. To prevent writes performed by new from
+        // being lost, take up a version for the initialization.
+        let this_txn_time_number = release_writes_and_get_txn_timestamp();
+
+        shadow_version_header.timestamp.store(this_txn_time_number, Release);
         let result: VersionedTVar<Header, ArrayMember> =
             VersionedTVar {
                 inner_type_erased: VersionedTVarTypeErased {
@@ -1844,8 +1852,7 @@ impl<'guard> VersionedTransaction<'guard> {
         // Acquire read seeing at least the number we move the counter to
         // must also happen-after all of the swaps we just performed.
 
-        let old_counter_value = TXN_WRITE_TIME.fetch_add(1, Release);
-        let this_txn_time_number = old_counter_value + 1;
+        let this_txn_time_number = release_writes_and_get_txn_timestamp();
 
         // Now that we have completed the commit, we still have to
         // perform some cleanup actions. For all captured tvars where we
