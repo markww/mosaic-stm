@@ -1046,14 +1046,16 @@ VersionedTVar<Header, ArrayMember> {
          mut trailing_array_init: Vec<ArrayMember>)
             -> VersionedTVar<Header, ArrayMember>
     {
+        let flexible_array_len = header_init.get_flexible_array_len();
         assert_eq!
-            (header_init.get_flexible_array_len(), trailing_array_init.len());
+            (flexible_array_len, trailing_array_init.len());
         // To use the same flow of functions that a regular update to the TVar
         // uses, just create a shadow version and turn it into a TVarImmVersion.
 
         let allocator_ref =
             get_or_create_version_allocator_for_layout
-                (TVarVersion::<Header, ArrayMember>::get_layout(0));
+                (TVarVersion::<Header, ArrayMember>::get_layout
+                    (flexible_array_len));
 
         let init_shadow_version =
             allocator_ref.alloc_shadow_version
