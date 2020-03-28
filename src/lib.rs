@@ -1129,13 +1129,10 @@ VersionedTVar<Header, ArrayMember> {
         result
     }
 
-    pub fn new_shared
-        (header_init: Header,
-         trailing_array_init: Vec<ArrayMember>)
-            -> SharedTVarRef<Header, ArrayMember>
+    fn new_shared_inner(shared_tvar: VersionedTVar<Header, ArrayMember>)
+        -> SharedTVarRef<Header, ArrayMember>
     {
-        let owned_ptr =
-            Owned::new(VersionedTVar::new(header_init, trailing_array_init));
+        let owned_ptr = Owned::new(shared_tvar);
         // Initially, the refct indicates that this is a non-refcounted tvar.
         // Update it to make it have a refcount of 1.
         (*owned_ptr).inner_type_erased.refct.store(1, Relaxed);
@@ -1159,6 +1156,21 @@ VersionedTVar<Header, ArrayMember> {
                 phantom_array_member: PhantomData
             }
         }
+
+    }
+
+    pub fn new_shared
+        (header_init: Header,
+         trailing_array_init: Vec<ArrayMember>)
+            -> SharedTVarRef<Header, ArrayMember>
+    {
+        Self::new_shared_inner
+            (VersionedTVar::new(header_init, trailing_array_init))
+    }
+
+    pub fn new_shared_empty() -> SharedTVarRef<Header, ArrayMember> {
+        Self::new_shared_inner
+            (VersionedTVar::<Header, ArrayMember>::new_empty())
     }
 
     pub fn retire(&self) {
@@ -3105,4 +3117,48 @@ mod tests {
             Ok(())
         });
     }
+
+    #[test]
+    fn test11_lazy_init_empty_shared_tvar() {
+        let shared_tvar_ref =
+            VersionedTVar::<SizeHeader, u64>::new_shared_empty();
+        use threadpool::Builder;
+        let pool = Builder::new().build();
+        for _ in 0..10 {
+            let per_thread_tvar_ref = shared_tvar_ref.clone();
+            pool.execute(move || {
+                VersionedTransaction::start_txn(|txn| {
+                    let mut tvar_capture =
+                        txn.capture_tvar_ref(&per_thread_tvar_ref)?;
+                    tvar_capture.fill_if_empty
+                        (SizeHeader { size: 10 },
+                            vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 36]);
+                    for array_item in
+                        tvar_capture
+                            .get_captured_tvar_mut()
+                            .get_flexible_array_slice_mut()
+                            .iter_mut()
+                    {
+                        *array_item += 1;
+                    }
+                    Ok(())
+                });
+            });
+        }
+        pool.join();
+        VersionedTransaction::start_txn(|txn| {
+            let tvar_capture = txn.capture_tvar_ref(&shared_tvar_ref)?;
+            for (seen, expected) in
+                tvar_capture
+                    .get_captured_tvar_ref()
+                    .get_flexible_array_slice()
+                    .iter()
+                    .zip(vec![10, 14, 18, 22, 26, 30, 34, 38, 42, 46])
+            {
+                assert_eq!(*seen, expected);
+            }
+            Ok(())
+        });
+    }
 }
+
