@@ -225,8 +225,8 @@ fn dealloc_tvar_version
     }
 }
 
-impl<Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-     ArrayMember: TVarVersionClone + 'static>
+impl<Header: FlexibleArrayHeader + Clone + 'static,
+     ArrayMember: Clone + 'static>
     TVarVersion<Header, ArrayMember>
 {
     fn get_layout(flexible_array_len: usize) -> Layout {
@@ -488,20 +488,6 @@ impl<Header: FlexibleArrayHeader, ArrayMember>
     }
 }
 
-// A version of Clone specifically for use in cloning versions of a tvar. This
-// is used because there are circumstances in which a type should not be
-// clonable in the traditional sense, but should be able to be cloned within a
-// tvar.
-pub trait TVarVersionClone {
-    fn tvar_version_clone(&self) -> Self;
-}
-
-impl<ClonableType: Clone> TVarVersionClone for ClonableType {
-    fn tvar_version_clone(&self) -> Self {
-        self.clone()
-    }
-}
-
 // An allocator for caching TVar versions in such a fashion that they can be
 // re-allocated quickly without synchronization.
 struct TVarVersionAllocator {
@@ -520,8 +506,8 @@ impl TVarVersionAllocator {
     }
 
     fn alloc_shadow_version
-        <Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-         ArrayMember: TVarVersionClone + 'static,
+        <Header: FlexibleArrayHeader + Clone + 'static,
+         ArrayMember: Clone + 'static,
          FlexArrayInitFn: FnOnce(&mut [MaybeUninit<ArrayMember>])>
         (&self, header_init: Header, array_member_init: FlexArrayInitFn)
         -> TVarShadowVersion<Header, ArrayMember>
@@ -576,12 +562,12 @@ impl TVarVersionAllocator {
     }
 
     fn alloc_duplicate_shadow_version
-        <Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-         ArrayMember: TVarVersionClone + 'static>
+        <Header: FlexibleArrayHeader + Clone + 'static,
+         ArrayMember: Clone + 'static>
         (&self, original: &TVarVersion<Header, ArrayMember>)
         -> TVarShadowVersion<Header, ArrayMember>
     {
-        let new_header = original.payload.header.tvar_version_clone();
+        let new_header = original.payload.header.clone();
         self.alloc_shadow_version_copy_prefix
             (original.payload.get_flexible_array_slice_ref(), new_header, None)
     }
@@ -592,8 +578,8 @@ impl TVarVersionAllocator {
     // new array is smaller than the old array, copy only the elements that
     // would be in-range in the new array from the old array.
     fn alloc_shadow_version_copy_prefix
-        <Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-         ArrayMember: TVarVersionClone + 'static>
+        <Header: FlexibleArrayHeader + Clone + 'static,
+         ArrayMember: Clone + 'static>
         (&self,
          original_trailing_slice: &[ArrayMember],
          new_header: Header,
@@ -607,13 +593,9 @@ impl TVarVersionAllocator {
                     if idx < original_trailing_slice.len() {
                         let entry_init =
                             if idx < original_trailing_slice.len() {
-                                original_trailing_slice[idx]
-                                    .tvar_version_clone()
+                                original_trailing_slice[idx].clone()
                               } else {
-                                  new_entries_init
-                                    .as_ref()
-                                    .unwrap()
-                                    .tvar_version_clone()
+                                  new_entries_init.as_ref().unwrap().clone()
                               };
                         new_entry_slot.write(entry_init);
                     }
@@ -1017,19 +999,19 @@ impl VersionedTVarTypeErased {
 // information is in the header itself. This is the common case; only advanced
 // users building growable data structures will probably want the full flexible
 // array functionality.
-pub struct SingletonHeader<GuardedType: TVarVersionClone>(GuardedType);
+pub struct SingletonHeader<GuardedType: Clone>(GuardedType);
 
-impl<GuardedType: TVarVersionClone> TVarVersionClone
+impl<GuardedType: Clone> Clone
     for SingletonHeader<GuardedType>
 {
-    fn tvar_version_clone(&self) -> Self {
+    fn clone(&self) -> Self {
         Self {
-            0: self.0.tvar_version_clone()
+            0: self.0.clone()
         }
     }
 }
 
-impl<GuardedType: TVarVersionClone> SingletonHeader<GuardedType> {
+impl<GuardedType: Clone> SingletonHeader<GuardedType> {
     fn new(init: GuardedType) -> SingletonHeader<GuardedType> {
         SingletonHeader {
             0: init
@@ -1037,7 +1019,7 @@ impl<GuardedType: TVarVersionClone> SingletonHeader<GuardedType> {
     }
 }
 
-impl<GuardedType: TVarVersionClone> FlexibleArrayHeader
+impl<GuardedType: Clone> FlexibleArrayHeader
     for SingletonHeader<GuardedType>
 {
     fn get_flexible_array_len(&self) -> usize {
@@ -1054,8 +1036,8 @@ pub struct VersionedTVar<Header: FlexibleArrayHeader, ArrayMember> {
 unsafe impl<Header: FlexibleArrayHeader, ArrayMember>
 Send for VersionedTVar<Header, ArrayMember> { }
 
-impl<Header : FlexibleArrayHeader + TVarVersionClone + 'static,
-     ArrayMember: TVarVersionClone + 'static>
+impl<Header : FlexibleArrayHeader + Clone + 'static,
+     ArrayMember: Clone + 'static>
 VersionedTVar<Header, ArrayMember> {
 
     pub const fn new_empty() -> VersionedTVar<Header, ArrayMember> {
@@ -1181,7 +1163,7 @@ VersionedTVar<Header, ArrayMember> {
 type FixedSizeTVar<GuardedType> =
     VersionedTVar<SingletonHeader<GuardedType>, ()>;
 
-impl<GuardedType: TVarVersionClone + 'static> FixedSizeTVar<GuardedType> {
+impl<GuardedType: Clone + 'static> FixedSizeTVar<GuardedType> {
     pub fn new_fixed_size(init: GuardedType) -> FixedSizeTVar<GuardedType> {
         Self::new(SingletonHeader::new(init), Vec::<()>::new())
     }
@@ -1200,8 +1182,8 @@ struct CapturedTVarCacheEntry {
 
 impl CapturedTVarCacheEntry {
 
-    fn new<Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-           ArrayMember: TVarVersionClone + 'static>
+    fn new<Header: FlexibleArrayHeader + Clone + 'static,
+           ArrayMember: Clone + 'static>
         (opt_captured_version: Option<TVarVersionPtr<Header, ArrayMember>>)
         -> CapturedTVarCacheEntry
     {
@@ -1224,8 +1206,8 @@ impl CapturedTVarCacheEntry {
     }
 
     fn assert_empty_and_fill
-        <Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-         ArrayMember: TVarVersionClone + 'static>
+        <Header: FlexibleArrayHeader + Clone + 'static,
+         ArrayMember: Clone + 'static>
         (&mut self,
          header_init: Header,
          mut array_member_init: Vec<ArrayMember>)
@@ -1310,8 +1292,8 @@ impl CapturedTVarCacheEntry {
     }
 
     fn get_shadow_copy_create_if_not_present
-        <Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-         ArrayMember: TVarVersionClone + 'static>(&mut self)
+        <Header: FlexibleArrayHeader + Clone + 'static,
+         ArrayMember: Clone + 'static>(&mut self)
             -> TVarShadowVersion<Header, ArrayMember>
     {
         PER_THREAD_TXN_STATE.with(|per_thread_txn_state| {
@@ -1366,8 +1348,8 @@ impl CapturedTVarCacheEntry {
 
     pub fn get_captured_tvar
         <'tvar_ref,
-            Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-            ArrayMember: TVarVersionClone + 'static>
+            Header: FlexibleArrayHeader + Clone + 'static,
+            ArrayMember: Clone + 'static>
         (&mut self, tvar_ref: &'tvar_ref VersionedTVarTypeErased)
         -> CapturedTVar<'tvar_ref, Header, ArrayMember>
     {
@@ -1384,8 +1366,8 @@ impl CapturedTVarCacheEntry {
     }
 
     pub fn resize_copy_prefix
-        <Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-         ArrayMember: TVarVersionClone + 'static>
+        <Header: FlexibleArrayHeader + Clone + 'static,
+         ArrayMember: Clone + 'static>
     (&mut self, new_header: Header, new_entries_init: Option<ArrayMember>) {
         PER_THREAD_TXN_STATE.with(|per_thread_txn_state| {
             *(per_thread_txn_state.borrow().is_write_txn.borrow_mut()) = true;
@@ -1451,8 +1433,8 @@ pub struct CapturedTVarRef
     <'tvar,
      'captured_tvar,
      'flex_array_ref,
-     Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-     ArrayMember: TVarVersionClone + 'static>
+     Header: FlexibleArrayHeader + Clone + 'static,
+     ArrayMember: Clone + 'static>
 {
     captured_tvar: &'captured_tvar CapturedTVar<'tvar, Header, ArrayMember>,
     inner_ref: &'flex_array_ref FlexibleArray<Header, ArrayMember>,
@@ -1466,8 +1448,8 @@ pub struct CapturedTVarRef
 impl<'tvar,
      'captured_tvar,
      'flex_array_ref,
-     Header: FlexibleArrayHeader + TVarVersionClone,
-     ArrayMember: TVarVersionClone>
+     Header: FlexibleArrayHeader + Clone,
+     ArrayMember: Clone>
 CapturedTVarRef<'tvar, 'captured_tvar, 'flex_array_ref, Header, ArrayMember>
 {
     pub fn get_flexible_array_header_ref(&self) -> &Header {
@@ -1486,8 +1468,8 @@ CapturedTVarRef<'tvar, 'captured_tvar, 'flex_array_ref, Header, ArrayMember>
 // We can always downgrade a mut to a ref, as consuming the unique mut means
 // that there are no remaining borrows of the tvar value.
 impl<'a, 'b, 'c,
-     Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-     ArrayMember: TVarVersionClone + 'static>
+     Header: FlexibleArrayHeader + Clone + 'static,
+     ArrayMember: Clone + 'static>
 From<CapturedTVarMut<'a, 'b, 'c, Header, ArrayMember>> for
     CapturedTVarRef<'a, 'b, 'c, Header, ArrayMember>
 {
@@ -1504,7 +1486,7 @@ From<CapturedTVarMut<'a, 'b, 'c, Header, ArrayMember>> for
 type CapturedFixedSizeTVarRef<'a, 'b, 'c, GuardedType> =
     CapturedTVarRef<'a, 'b, 'c, SingletonHeader<GuardedType>, ()>;
 
-impl<'a, 'b, 'c, GuardedType: TVarVersionClone>
+impl<'a, 'b, 'c, GuardedType: Clone>
 AsRef<GuardedType> for CapturedFixedSizeTVarRef<'a, 'b, 'c, GuardedType>
 {
     fn as_ref(&self) -> &GuardedType {
@@ -1512,7 +1494,7 @@ AsRef<GuardedType> for CapturedFixedSizeTVarRef<'a, 'b, 'c, GuardedType>
     }
 }
 
-impl<'a, 'b, 'c, GuardedType: TVarVersionClone> Deref for
+impl<'a, 'b, 'c, GuardedType: Clone> Deref for
     CapturedFixedSizeTVarRef<'a, 'b, 'c, GuardedType>
 {
     type Target = GuardedType;
@@ -1526,16 +1508,16 @@ pub struct CapturedTVarMut
     <'tvar,
      'captured_tvar,
      'flex_array_ref,
-     Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-     ArrayMember: TVarVersionClone + 'static>
+     Header: FlexibleArrayHeader + Clone + 'static,
+     ArrayMember: Clone + 'static>
 {
     captured_tvar: &'captured_tvar mut CapturedTVar<'tvar, Header, ArrayMember>,
     inner_mut: &'flex_array_ref mut FlexibleArray<Header, ArrayMember>
 }
 
 impl<'a, 'b, 'c,
-     Header: FlexibleArrayHeader + TVarVersionClone,
-     ArrayMember: TVarVersionClone>
+     Header: FlexibleArrayHeader + Clone,
+     ArrayMember: Clone>
 CapturedTVarMut<'a, 'b, 'c, Header, ArrayMember>
 {
     pub fn get_flexible_array_header_ref(&self) -> &Header {
@@ -1567,7 +1549,7 @@ CapturedTVarMut<'a, 'b, 'c, Header, ArrayMember>
 type CapturedFixedSizeTVarMut<'a, 'b, 'c, GuardedType> =
     CapturedTVarMut<'a, 'b, 'c, SingletonHeader<GuardedType>, ()>;
 
-impl<'a, 'b, 'c, GuardedType: TVarVersionClone>
+impl<'a, 'b, 'c, GuardedType: Clone>
 AsRef<GuardedType> for CapturedFixedSizeTVarMut<'a, 'b, 'c, GuardedType>
 {
     fn as_ref(&self) -> &GuardedType {
@@ -1575,14 +1557,14 @@ AsRef<GuardedType> for CapturedFixedSizeTVarMut<'a, 'b, 'c, GuardedType>
     }
 }
 
-impl<'a, 'b, 'c, GuardedType: TVarVersionClone>
+impl<'a, 'b, 'c, GuardedType: Clone>
 AsMut<GuardedType> for CapturedFixedSizeTVarMut<'a, 'b, 'c, GuardedType> {
     fn as_mut(&mut self) -> &mut GuardedType {
         &mut self.inner_mut.header.0
     }
 }
 
-impl<'a, 'b, 'c, GuardedType: TVarVersionClone>
+impl<'a, 'b, 'c, GuardedType: Clone>
 Deref for CapturedFixedSizeTVarMut<'a, 'b, 'c, GuardedType> {
     type Target = GuardedType;
 
@@ -1591,7 +1573,7 @@ Deref for CapturedFixedSizeTVarMut<'a, 'b, 'c, GuardedType> {
     }
 }
 
-impl<'a, 'b, 'c, GuardedType: TVarVersionClone>
+impl<'a, 'b, 'c, GuardedType: Clone>
 DerefMut for CapturedFixedSizeTVarMut<'a, 'b, 'c, GuardedType> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner_mut.header.0
@@ -1600,8 +1582,8 @@ DerefMut for CapturedFixedSizeTVarMut<'a, 'b, 'c, GuardedType> {
 
 pub struct CapturedTVar
     <'key,
-     Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-     ArrayMember: TVarVersionClone + 'static>
+     Header: FlexibleArrayHeader + Clone + 'static,
+     ArrayMember: Clone + 'static>
 {
     tvar_ref: &'key VersionedTVarTypeErased,
     phantom_header: PhantomData<Header>,
@@ -1609,8 +1591,8 @@ pub struct CapturedTVar
 }
 
 impl<'key,
-     Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-     ArrayMember: TVarVersionClone + 'static>
+     Header: FlexibleArrayHeader + Clone + 'static,
+     ArrayMember: Clone + 'static>
 CapturedTVar<'key, Header, ArrayMember> {
 
     pub fn is_filled(&self) -> bool {
@@ -1734,8 +1716,8 @@ CapturedTVar<'key, Header, ArrayMember> {
 }
 
 impl<'key,
-     Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-     ArrayMember: TVarVersionClone + 'static>
+     Header: FlexibleArrayHeader + Clone + 'static,
+     ArrayMember: Clone + 'static>
 Drop for CapturedTVar<'key, Header, ArrayMember>
 {
     fn drop(&mut self) {
@@ -2123,8 +2105,8 @@ impl<'guard> VersionedTransaction<'guard> {
     }
 
     pub fn capture_tvar_ref
-    <Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-     ArrayMember: TVarVersionClone + 'static>
+    <Header: FlexibleArrayHeader + Clone + 'static,
+     ArrayMember: Clone + 'static>
         (&self, shared_tvar_ref: &SharedTVarRef<Header, ArrayMember>)
             -> Result<CapturedTVar<Header, ArrayMember>, TxnErrStatus>
     {
@@ -2134,8 +2116,8 @@ impl<'guard> VersionedTransaction<'guard> {
     }
 
     pub fn capture_tvar
-    <'a, Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-     ArrayMember: TVarVersionClone + 'static>
+    <'a, Header: FlexibleArrayHeader + Clone + 'static,
+     ArrayMember: Clone + 'static>
         (&self, tvar: &'a VersionedTVar<Header, ArrayMember>)
             -> Result<CapturedTVar<'a, Header, ArrayMember>,
                       TxnErrStatus>
@@ -2145,8 +2127,8 @@ impl<'guard> VersionedTransaction<'guard> {
 
 
     fn capture_type_erased_tvar
-        <'a, Header: FlexibleArrayHeader + TVarVersionClone + 'static,
-        ArrayMember: TVarVersionClone + 'static>
+        <'a, Header: FlexibleArrayHeader + Clone + 'static,
+        ArrayMember: Clone + 'static>
         (&self, tvar: &'a VersionedTVarTypeErased)
             -> Result<CapturedTVar<'a, Header, ArrayMember>,
                       TxnErrStatus>
@@ -2959,10 +2941,10 @@ mod tests {
                             (post_insert_header, Some(T::default()));
                     let mutable_vec_slice =
                         possibly_resized_vec.get_flexible_array_slice_mut();
-                    let mut item_to_insert = new_val.tvar_version_clone();
+                    let mut item_to_insert = new_val.clone();
                     for current_idx in insert_idx..mutable_vec_slice.len() {
                         let old_contents =
-                            mutable_vec_slice[current_idx].tvar_version_clone();
+                            mutable_vec_slice[current_idx].clone();
                         mutable_vec_slice[current_idx] = item_to_insert;
                         item_to_insert = old_contents;
                     }
