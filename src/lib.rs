@@ -1,5 +1,9 @@
 #![feature(alloc_layout_extra)]
 #![feature(maybe_uninit_extra)]
+#![feature(const_fn)]
+#![feature(const_if_match)]
+#![feature(const_raw_ptr_to_usize_cast)]
+#![feature(const_panic)]
 
 use indexmap::IndexMap;
 use indexmap::map::Entry::Occupied;
@@ -17,6 +21,7 @@ use std::sync::atomic::Ordering;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::Ordering::Release;
+use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::spin_loop_hint;
 use std::marker::PhantomData;
 use std::alloc::GlobalAlloc;
@@ -42,8 +47,8 @@ use crossbeam_epoch::Guard;
 
 static TXN_WRITE_TIME: AtomicU64 = AtomicU64::new(0);
 
-fn release_writes_and_get_txn_timestamp() -> u64 {
-    let old_counter_value = TXN_WRITE_TIME.fetch_add(1, Release);
+fn get_and_advance_txn_timestamp_acquire_release() -> u64 {
+    let old_counter_value = TXN_WRITE_TIME.fetch_add(1, AcqRel);
     old_counter_value + 1
 }
 
@@ -417,13 +422,6 @@ fn fetch_info_for_type_id(type_id: TypeId) -> TypeInfo {
 struct TVarVersionHeaderPtr(NonNull<TVarVersionHeader>);
 
 impl TVarVersionHeaderPtr {
-
-    fn has_payload_type
-        <Header: FlexibleArrayHeader + 'static, ArrayMember: 'static>(&self)
-        -> bool
-    {
-        unsafe { self.0.as_ref() }.has_payload_type::<Header, ArrayMember>()
-    }
 
     fn cast_to_version_pointer
         <Header: FlexibleArrayHeader + 'static, ArrayMember: 'static>(&self)
@@ -877,27 +875,37 @@ pub type SharedFixedSizeTVarRef<GuardedType> =
     SharedTVarRef<SingletonHeader<GuardedType>, ()>;
 
 struct CanonPtrAndWriteReserved {
-    canon_ptr: TVarVersionHeaderPtr,
+    // If this is None, then the tvar is uninit.
+    canon_ptr: Option<TVarVersionHeaderPtr>,
     write_reserved: bool
 }
 
 impl CanonPtrAndWriteReserved {
-    fn new(dyn_pointer: TVarVersionHeaderPtr, write_reserved: bool)
+
+    const fn get_canon_ptr_as_int(opt_header_ptr: Option<TVarVersionHeaderPtr>)
+        -> u64
+    {
+        match opt_header_ptr {
+            Some(header_ptr) => unsafe { header_ptr.0.as_ptr() as u64 },
+            None => 0
+        }
+    }
+
+    const fn new(opt_canon_pointer: Option<TVarVersionHeaderPtr>,
+           write_reserved: bool)
         -> CanonPtrAndWriteReserved
     {
-        let canon_ptr_as_int = dyn_pointer.0.as_ptr() as u64;
-        // Assert that the bottom bit of the pointer is 0. If this isn't the
-        // case, we can't pack it.
+        let canon_ptr_as_int = Self::get_canon_ptr_as_int(opt_canon_pointer);
         assert!(canon_ptr_as_int & 1 == 0);
 
         CanonPtrAndWriteReserved {
-            canon_ptr: dyn_pointer,
+            canon_ptr: opt_canon_pointer,
             write_reserved
         }
     }
 
-    fn pack(&self) -> u64 {
-        let canon_ptr_as_int = self.canon_ptr.0.as_ptr() as u64;
+    const fn pack(&self) -> u64 {
+        let canon_ptr_as_int = Self::get_canon_ptr_as_int(self.canon_ptr);
         // Assert that the bottom bit of the pointer is 0.
         assert!(canon_ptr_as_int & 1 == 0);
         canon_ptr_as_int | if self.write_reserved { 1 } else { 0 }
@@ -906,9 +914,12 @@ impl CanonPtrAndWriteReserved {
     fn unpack(packed: u64) -> CanonPtrAndWriteReserved {
         let write_reserved = (packed & 1) == 1;
         let canon_raw = ((packed >> 1) << 1) as * mut TVarVersionHeader;
-        let canon_nonnull = NonNull::new(canon_raw).unwrap();
-        let canon_ptr = TVarVersionHeaderPtr { 0: canon_nonnull };
-        CanonPtrAndWriteReserved::new(canon_ptr, write_reserved)
+        let opt_canon_nonnull = NonNull::new(canon_raw);
+        let opt_canon_ptr =
+            opt_canon_nonnull.map(|canon_nonnull| {
+                TVarVersionHeaderPtr { 0: canon_nonnull }
+            });
+        CanonPtrAndWriteReserved::new(opt_canon_ptr, write_reserved)
     }
 }
 
@@ -929,11 +940,13 @@ impl VersionedTVarTypeErased {
         CanonPtrAndWriteReserved::unpack(packed_canon_ptr)
     }
 
-    fn has_canon_version_ptr(&self, candidate: TVarVersionHeaderPtr) -> bool {
+    fn has_canon_version_ptr(&self, candidate: Option<TVarVersionHeaderPtr>)
+        -> bool
+    {
         self.fetch_and_unpack_canon_ptr(Relaxed).canon_ptr == candidate
     }
 
-    fn get_current_canon_version(&self) -> TVarVersionHeaderPtr {
+    fn get_current_canon_version(&self) -> Option<TVarVersionHeaderPtr> {
         let canon_ptr_and_write_reserved =
             self.fetch_and_unpack_canon_ptr(Acquire);
 
@@ -990,10 +1003,13 @@ impl VersionedTVarTypeErased {
             }
         };
 
-        let former_canon_ptr_allocator =
-            unsafe { former_canon_ptr.0.as_ref() }.allocator;
-        former_canon_ptr_allocator
-            .return_formerly_canon_pointer(former_canon_ptr);
+        former_canon_ptr.and_then(|present_former_canon_ptr| {
+            let former_canon_ptr_allocator =
+                unsafe { present_former_canon_ptr.0.as_ref() }.allocator;
+            former_canon_ptr_allocator
+                .return_formerly_canon_pointer(present_former_canon_ptr);
+            Some(())
+        });
     }
 }
 
@@ -1041,6 +1057,20 @@ Send for VersionedTVar<Header, ArrayMember> { }
 impl<Header : FlexibleArrayHeader + TVarVersionClone + 'static,
      ArrayMember: TVarVersionClone + 'static>
 VersionedTVar<Header, ArrayMember> {
+
+    pub const fn new_empty() -> VersionedTVar<Header, ArrayMember> {
+        VersionedTVar {
+            inner_type_erased: VersionedTVarTypeErased {
+                refct: AtomicU64::new(NON_REFCT_TVAR),
+                packed_canon_ptr:
+                    AtomicU64::new
+                        (CanonPtrAndWriteReserved::new(None, false).pack())
+            },
+            phantom_header: PhantomData,
+            phantom_array_member: PhantomData
+        }
+    }
+
     pub fn new
         (header_init: Header,
          mut trailing_array_init: Vec<ArrayMember>)
@@ -1076,13 +1106,14 @@ VersionedTVar<Header, ArrayMember> {
 
         let canon_ptr_and_write_reserved =
             CanonPtrAndWriteReserved::new
-                (shadow_version_ptr.get_header_pointer(), false);
+                (Some(shadow_version_ptr.get_header_pointer()), false);
 
         // If lazy_static! is used to create a VersionedTVar, the initialization
         // of this tvar can occur at an arbitrary time - possibly after other
         // transactions have launched. To prevent writes performed by new from
         // being lost, take up a version for the initialization.
-        let this_txn_time_number = release_writes_and_get_txn_timestamp();
+        let this_txn_time_number =
+            get_and_advance_txn_timestamp_acquire_release();
 
         shadow_version_header.timestamp.store(this_txn_time_number, Release);
         let result: VersionedTVar<Header, ArrayMember> =
@@ -1150,7 +1181,7 @@ impl<GuardedType: TVarVersionClone + 'static> FixedSizeTVar<GuardedType> {
 }
 
 struct CapturedTVarCacheEntry {
-    captured_version_ptr: TVarVersionHeaderPtr,
+    captured_version_ptr: Option<TVarVersionHeaderPtr>,
     shadow_copy_ptr: Option<TVarShadowVersionTypeErased>,
     in_use: bool
 }
@@ -1159,15 +1190,62 @@ impl CapturedTVarCacheEntry {
 
     fn new<Header: FlexibleArrayHeader + TVarVersionClone + 'static,
            ArrayMember: TVarVersionClone + 'static>
-        (captured_version: TVarVersionPtr<Header, ArrayMember>)
+        (opt_captured_version: Option<TVarVersionPtr<Header, ArrayMember>>)
         -> CapturedTVarCacheEntry
     {
-        let captured_version_header_ptr = captured_version.get_header_pointer();
+        let opt_captured_version_header_ptr =
+            opt_captured_version.map
+                (|captured_version|{ captured_version.get_header_pointer() });
         CapturedTVarCacheEntry {
-            captured_version_ptr: captured_version_header_ptr,
+            captured_version_ptr: opt_captured_version_header_ptr,
             shadow_copy_ptr: None,
             in_use: false,
         }
+    }
+
+    fn is_filled(&self) -> bool {
+        self.captured_version_ptr.is_some() || self.shadow_copy_ptr.is_some()
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.is_filled()
+    }
+
+    fn assert_empty_and_fill
+        <Header: FlexibleArrayHeader + TVarVersionClone + 'static,
+         ArrayMember: TVarVersionClone + 'static>
+        (&mut self,
+         header_init: Header,
+         mut array_member_init: Vec<ArrayMember>)
+    {
+        assert!
+            (self.is_empty(),
+             "CapturedTVar was expected to be empty, but was filled");
+        let flexible_array_len = header_init.get_flexible_array_len();
+        assert_eq!
+            (flexible_array_len,
+             array_member_init.len(),
+             "Expected the header and the array member inits to agree on \
+              flexible array length");
+        let allocator_ref =
+            get_or_create_version_allocator_for_layout
+                (TVarVersion::<Header, ArrayMember>::get_layout
+                    (flexible_array_len));
+        let shadow_version =
+            allocator_ref.alloc_shadow_version
+                (header_init, move |maybe_uninit_slice|{
+                    for (uninit_array_member, init_array_member) in
+                        maybe_uninit_slice
+                            .iter_mut()
+                            .zip(array_member_init.drain(..))
+                    {
+                        uninit_array_member.write(init_array_member);
+                    }
+                });
+        self.shadow_copy_ptr = Some(shadow_version.erase_type());
+        PER_THREAD_TXN_STATE.with(|per_thread_txn_state| {
+            *(per_thread_txn_state.borrow().is_write_txn.borrow_mut()) = true;
+        });
     }
 
     fn get_flexible_array_len
@@ -1179,22 +1257,31 @@ impl CapturedTVarCacheEntry {
                 present_shadow_copy.trailing_array_size
             },
             None => {
-                let captured_version_ptr =
+                let opt_captured_version_ptr =
                     self.get_captured_version::<Header, ArrayMember>();
-                let captured_version_ref =
-                    unsafe { captured_version_ptr.0.as_ref() };
-                captured_version_ref.payload.header.get_flexible_array_len()
+                match opt_captured_version_ptr {
+                    Some(captured_version_ptr) => {
+                        let captured_version_ref =
+                            unsafe { captured_version_ptr.0.as_ref() };
+                        captured_version_ref
+                            .payload.header.get_flexible_array_len()
+                    },
+                    None =>
+                        panic!("Attempt to get flexible array len on an \
+                                unfilled tvar")
+                }
             }
         }
     }
 
     fn get_captured_version
         <Header: FlexibleArrayHeader + 'static, ArrayMember: 'static>(&self)
-         -> TVarVersionPtr<Header, ArrayMember>
+         -> Option<TVarVersionPtr<Header, ArrayMember>>
     {
-        let result_dynamic_inner_version_ptr = self.captured_version_ptr;
-        result_dynamic_inner_version_ptr
-            .cast_to_version_pointer::<Header, ArrayMember>()
+        self.captured_version_ptr.map(|present_captured_version_ptr| {
+            present_captured_version_ptr
+                .cast_to_version_pointer::<Header, ArrayMember>()
+        })
     }
 
     fn get_optional_shadow_copy
@@ -1222,15 +1309,27 @@ impl CapturedTVarCacheEntry {
         match self.get_optional_shadow_copy() {
             Some(already_present_shadow_copy) => already_present_shadow_copy,
             None => {
-                let captured_version_ptr =
+                let opt_captured_version_ptr =
                     self.get_captured_version::<Header, ArrayMember>();
-                let captured_version_ref =
-                    unsafe { captured_version_ptr.0.as_ref() };
-                let allocator_ref = captured_version_ref.header.allocator;
-                let dup_shadow_version = allocator_ref
-                    .alloc_duplicate_shadow_version(captured_version_ref);
-                self.shadow_copy_ptr = Some(dup_shadow_version.erase_type());
-                dup_shadow_version
+                match opt_captured_version_ptr {
+                    Some(captured_version_ptr) => {
+                        let captured_version_ref =
+                            unsafe { captured_version_ptr.0.as_ref() };
+                        let allocator_ref =
+                            captured_version_ref.header.allocator;
+                        let dup_shadow_version =
+                            allocator_ref
+                                .alloc_duplicate_shadow_version
+                                    (captured_version_ref);
+                        self.shadow_copy_ptr =
+                            Some(dup_shadow_version.erase_type());
+                        dup_shadow_version
+                    },
+                    None => {
+                        panic!("Attempt to duplicate the version of \
+                                an unfilled tvar")
+                    }
+                }
             }
         }
     }
@@ -1244,7 +1343,12 @@ impl CapturedTVarCacheEntry {
             self.get_optional_shadow_copy::<Header, ArrayMember>();
         match opt_shadow_copy_ref {
             Some(present_shadow_copy) => present_shadow_copy.version_ptr,
-            None => self.get_captured_version::<Header, ArrayMember>()
+            None => match self.get_captured_version::<Header, ArrayMember>() {
+                Some(captured_version) => captured_version,
+                None => panic!
+                    ("Attempt to get the captured version of an unfilled \
+                      tvar")
+            }
         }
     }
 
@@ -1324,10 +1428,6 @@ impl CapturedTVarCacheEntry {
 struct CapturedTVarIndex(NonNull<VersionedTVarTypeErased>);
 
 impl CapturedTVarIndex {
-    fn get_nonnull(&self) -> NonNull<VersionedTVarTypeErased> {
-        self.0
-    }
-
     fn new(tvar_ref: &VersionedTVarTypeErased) -> CapturedTVarIndex {
         CapturedTVarIndex {
             0: NonNull::from(tvar_ref)
@@ -1501,6 +1601,37 @@ impl<'key,
      ArrayMember: TVarVersionClone + 'static>
 CapturedTVar<'key, Header, ArrayMember> {
 
+    pub fn is_filled(&self) -> bool {
+        self.with_captured_tvar_ref_cell(|tvar_cache_entry| {
+            tvar_cache_entry.borrow().is_filled()
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.is_filled()
+    }
+
+    pub fn assert_empty_and_fill
+        (&mut self,
+         header_init: Header,
+         array_member_init: Vec<ArrayMember>)
+    {
+        self.with_captured_tvar_ref_cell(|tvar_cache_entry| {
+            tvar_cache_entry.borrow_mut().assert_empty_and_fill
+                (header_init, array_member_init);
+        });
+    }
+
+    pub fn fill_if_empty
+        (&mut self,
+         header_init: Header,
+         array_member_init: Vec<ArrayMember>)
+    {
+        if self.is_empty() {
+            self.assert_empty_and_fill(header_init, array_member_init);
+        }
+    }
+
     fn get_cache_index(&self) -> CapturedTVarIndex {
         let tvar_const_ptr = self.tvar_ref as * const VersionedTVarTypeErased;
         CapturedTVarIndex {
@@ -1531,6 +1662,9 @@ CapturedTVar<'key, Header, ArrayMember> {
 
     pub fn get_captured_tvar_ref(&self) -> CapturedTVarRef<Header, ArrayMember>
     {
+        assert!
+            (self.is_filled(),
+             "Cannot get a tvar ref to an unfilled tvar");
         let inner_ref =
             self.with_captured_tvar_ref_cell(|captured_tvar_cache_entry|{
                 let captured_tvar_cache_entry_ref =
@@ -1552,6 +1686,9 @@ CapturedTVar<'key, Header, ArrayMember> {
             -> CapturedTVarMut
                 <'key, 'captured_tvar, 'flex_array_ref, Header, ArrayMember>
     {
+        assert!
+            (self.is_filled(),
+             "Cannot get a mutable tvar ref to an unfilled tvar");
         let shadow_version =
             self.with_captured_tvar_ref_cell(|captured_tvar_cache_entry|{
                 let mut captured_tvar_cache_entry_mut =
@@ -1576,7 +1713,6 @@ CapturedTVar<'key, Header, ArrayMember> {
         -> CapturedTVarMut
             <'key, 'captured_tvar, 'flex_array_ref, Header, ArrayMember>
     {
-        let flexible_array_len_override = header.get_flexible_array_len();
         self.with_captured_tvar_ref_cell(|captured_tvar| {
             captured_tvar.borrow_mut().resize_copy_prefix
                 (header, new_entry_fill)
@@ -1602,10 +1738,6 @@ Drop for CapturedTVar<'key, Header, ArrayMember>
 
 pub type CapturedFixedSizedTVarCacheKey<'key, GuardedType> =
     CapturedTVar<'key, SingletonHeader<GuardedType>, ()>;
-
-lazy_static! {
-    static ref WRITE_TXN_TIME: AtomicU64 = AtomicU64::new(0);
-}
 
 struct PerThreadTransactionState {
     // This associates tvars with captures so that we can look up the captured
@@ -1669,7 +1801,7 @@ pub struct TxnErrStatus { }
 // This enum is to help in VersionedTransaction's hit_tvar_cache method.
 enum TVarIndexResult<Header: FlexibleArrayHeader, ArrayMember> {
     KnownFreshIndex,
-    MaybeNotFreshContext(TVarVersionPtr<Header, ArrayMember>, u64)
+    MaybeNotFreshContext(Option<TVarVersionPtr<Header, ArrayMember>>, u64)
 }
 
 // This struct actually contains little transaction data. It acts as a gateway
@@ -1843,7 +1975,7 @@ impl<'guard> VersionedTransaction<'guard> {
                         .packed_canon_ptr
                         .store
                             (CanonPtrAndWriteReserved::new
-                                (shadow_version_header_ptr, false).pack(),
+                                (Some(shadow_version_header_ptr), false).pack(),
                              Release)
                 },
                 None => tvar_ref.clear_write_reservation()
@@ -1853,11 +1985,12 @@ impl<'guard> VersionedTransaction<'guard> {
         // At this point, we have updated all of the tvars with our new
         // versions, but none of those versions have a canonical time. Now,
         // we must fetch the canonical time for this transaction. We perform
-        // a fetch-add with a release ordering. This means that any
+        // a fetch-add with acquire-release ordering. This means that any
         // Acquire read seeing at least the number we move the counter to
         // must also happen-after all of the swaps we just performed.
 
-        let this_txn_time_number = release_writes_and_get_txn_timestamp();
+        let this_txn_time_number =
+            get_and_advance_txn_timestamp_acquire_release();
 
         // Now that we have completed the commit, we still have to
         // perform some cleanup actions. For all captured tvars where we
@@ -1883,9 +2016,14 @@ impl<'guard> VersionedTransaction<'guard> {
             }
             // For writes, place the old canon version onto the stale
             // version list.
-            let old_canon = captured_tvar.borrow().captured_version_ptr;
-            let old_canon_ref = unsafe { old_canon.0.as_ref() };
-            old_canon_ref.allocator.return_formerly_canon_pointer(old_canon);
+            let opt_old_canon = captured_tvar.borrow().captured_version_ptr;
+            opt_old_canon.and_then(|old_canon|{
+                let old_canon_ref = unsafe { old_canon.0.as_ref() };
+                old_canon_ref
+                    .allocator
+                    .return_formerly_canon_pointer(old_canon);
+                Some(())
+            });
         }
 
         return true;
@@ -2028,9 +2166,11 @@ impl<'guard> VersionedTransaction<'guard> {
                             versioned_tvar_type_erased
                                 .get_current_canon_version();
                         let cast_current_canon =
-                            current_canon
-                                .cast_to_version_pointer
-                                    ::<Header, ArrayMember>();
+                            current_canon.map(|present_current_canon| {
+                                present_current_canon
+                                    .cast_to_version_pointer
+                                    ::<Header, ArrayMember>()
+                            });
                         let captured_tvar =
                             CapturedTVarCacheEntry::new(cast_current_canon);
                         // The captured tvar we inserted may have a timestamp
@@ -2038,9 +2178,12 @@ impl<'guard> VersionedTransaction<'guard> {
                         // start. If that's the case, we need to check that all
                         // captured entries (except the just captured one) are
                         // still current.
-                        let pointee_timestamp =
-                            current_canon
-                                .get_pointee_timestamp_val_expect_canon();
+                        let pointee_timestamp = match current_canon {
+                            Some(present_current_canon) =>
+                                present_current_canon
+                                    .get_pointee_timestamp_val_expect_canon(),
+                            None => 0
+                        };
                         // If the timestamp is earlier than the acquisition
                         // threshold, we are in good shape and can insert the
                         // entry into the map.
@@ -2613,27 +2756,27 @@ mod tests {
         TVAR_INT2.retire();
     }
 
+    #[derive(Clone, Copy)]
+    pub struct SizeHeader {
+        size: usize
+    }
+
+    impl SizeHeader {
+        fn new(size: usize) -> SizeHeader {
+            SizeHeader {
+                size: size
+            }
+        }
+    }
+
+    impl FlexibleArrayHeader for SizeHeader {
+        fn get_flexible_array_len(&self) -> usize {
+            self.size
+        }
+    }
+
     mod test6_state {
         use super::*;
-
-        #[derive(Clone, Copy)]
-        pub struct SizeHeader {
-            size: usize
-        }
-
-        impl SizeHeader {
-            fn new(size: usize) -> SizeHeader {
-                SizeHeader {
-                    size: size
-                }
-            }
-        }
-
-        impl FlexibleArrayHeader for SizeHeader {
-            fn get_flexible_array_len(&self) -> usize {
-                self.size
-            }
-        }
 
         lazy_static! {
             pub static ref TVAR1: VersionedTVar<SizeHeader, u64> =
@@ -2893,4 +3036,73 @@ mod tests {
         });
     }
 
+    mod test9_state {
+        use super::*;
+
+        pub static TVAR: VersionedTVar<SizeHeader, u64> =
+            VersionedTVar::new_empty();
+    }
+
+    #[test]
+    fn test9_lazy_init_empty_tvar() {
+        use test9_state::*;
+        use threadpool::Builder;
+        let pool = Builder::new().build();
+        for _ in 0..10 {
+            pool.execute(|| {
+                VersionedTransaction::start_txn(|txn| {
+                    let mut tvar_capture = txn.capture_tvar(&TVAR)?;
+                    tvar_capture.fill_if_empty
+                        (SizeHeader { size: 10 },
+                            vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 36]);
+                    for array_item in
+                        tvar_capture
+                            .get_captured_tvar_mut()
+                            .get_flexible_array_slice_mut()
+                            .iter_mut()
+                    {
+                        *array_item += 1;
+                    }
+                    Ok(())
+                });
+            });
+        }
+        pool.join();
+        VersionedTransaction::start_txn(|txn| {
+            let tvar_capture = txn.capture_tvar(&TVAR)?;
+            for (seen, expected) in
+                tvar_capture
+                    .get_captured_tvar_ref()
+                    .get_flexible_array_slice()
+                    .iter()
+                    .zip(vec![10, 14, 18, 22, 26, 30, 34, 38, 42, 46])
+            {
+                assert_eq!(*seen, expected);
+            }
+            Ok(())
+        });
+    }
+
+    mod test10_state {
+        use super::*;
+
+        pub static TVAR: VersionedTVar<SizeHeader, u64> =
+            VersionedTVar::new_empty();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test10_assert_init_twice() {
+        use test10_state::TVAR;
+        VersionedTransaction::start_txn(|txn| {
+            let mut tvar_capture = txn.capture_tvar(&TVAR)?;
+            tvar_capture.assert_empty_and_fill
+                (SizeHeader { size: 10 },
+                    vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 36]);
+             tvar_capture.assert_empty_and_fill
+                (SizeHeader { size: 10 },
+                    vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 36]);
+            Ok(())
+        });
+    }
 }
