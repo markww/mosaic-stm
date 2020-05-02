@@ -1053,9 +1053,7 @@ VersionedTVar<Header, ArrayMember> {
         }
     }
 
-    pub fn new
-        (header_init: Header,
-         mut trailing_array_init: Vec<ArrayMember>)
+    pub fn new(header_init: Header, trailing_array_init: &[ArrayMember])
             -> VersionedTVar<Header, ArrayMember>
     {
         let flexible_array_len = header_init.get_flexible_array_len();
@@ -1074,9 +1072,9 @@ VersionedTVar<Header, ArrayMember> {
                 (header_init,
                  |new_slice: &mut [MaybeUninit<ArrayMember>]| {
                     for (original_item, uninit_item) in
-                        trailing_array_init.drain(..).zip(new_slice.iter_mut())
+                        trailing_array_init.iter().zip(new_slice.iter_mut())
                     {
-                        uninit_item.write(original_item);
+                        uninit_item.write(original_item.clone());
                     }
                  });
 
@@ -1141,9 +1139,7 @@ VersionedTVar<Header, ArrayMember> {
 
     }
 
-    pub fn new_shared
-        (header_init: Header,
-         trailing_array_init: Vec<ArrayMember>)
+    pub fn new_shared(header_init: Header, trailing_array_init: &[ArrayMember])
             -> SharedTVarRef<Header, ArrayMember>
     {
         Self::new_shared_inner
@@ -1165,12 +1161,14 @@ type FixedSizeTVar<GuardedType> =
 
 impl<GuardedType: Clone + 'static> FixedSizeTVar<GuardedType> {
     pub fn new_fixed_size(init: GuardedType) -> FixedSizeTVar<GuardedType> {
-        Self::new(SingletonHeader::new(init), Vec::<()>::new())
+        let empty_unit_array: [(); 0] = [ ];
+        Self::new(SingletonHeader::new(init), &empty_unit_array)
     }
 
     pub fn new_shared_fixed_size(init: GuardedType)
         -> SharedFixedSizeTVarRef<GuardedType> {
-        Self::new_shared(SingletonHeader::new(init), Vec::<()>::new())
+        let empty_unit_array: [(); 0] = [ ];
+        Self::new_shared(SingletonHeader::new(init), &empty_unit_array)
     }
 }
 
@@ -1210,7 +1208,7 @@ impl CapturedTVarCacheEntry {
          ArrayMember: Clone + 'static>
         (&mut self,
          header_init: Header,
-         mut array_member_init: Vec<ArrayMember>)
+         array_member_init: &[ArrayMember])
     {
         assert!
             (self.is_empty(),
@@ -1231,9 +1229,9 @@ impl CapturedTVarCacheEntry {
                     for (uninit_array_member, init_array_member) in
                         maybe_uninit_slice
                             .iter_mut()
-                            .zip(array_member_init.drain(..))
+                            .zip(array_member_init.iter())
                     {
-                        uninit_array_member.write(init_array_member);
+                        uninit_array_member.write(init_array_member.clone());
                     }
                 });
         self.shadow_copy_ptr = Some(shadow_version.erase_type());
@@ -1608,7 +1606,7 @@ CapturedTVar<'key, Header, ArrayMember> {
     pub fn assert_empty_and_fill
         (&mut self,
          header_init: Header,
-         array_member_init: Vec<ArrayMember>)
+         array_member_init: &[ArrayMember])
     {
         self.with_captured_tvar_ref_cell(|tvar_cache_entry| {
             tvar_cache_entry.borrow_mut().assert_empty_and_fill
@@ -1619,7 +1617,7 @@ CapturedTVar<'key, Header, ArrayMember> {
     pub fn fill_if_empty
         (&mut self,
          header_init: Header,
-         array_member_init: Vec<ArrayMember>)
+         array_member_init: &[ArrayMember])
     {
         if self.is_empty() {
             self.assert_empty_and_fill(header_init, array_member_init);
@@ -2772,13 +2770,14 @@ mod tests {
     mod test6_state {
         use super::*;
 
+        const TVAR1_ARRAY_INIT: [u64; 3] = [4, 5, 6];
+        const TVAR2_ARRAY_INIT: [u64; 6] = [7, 8, 9, 10, 11, 12];
+
         lazy_static! {
             pub static ref TVAR1: VersionedTVar<SizeHeader, u64> =
-                VersionedTVar::new(SizeHeader::new(3), vec![4, 5, 6]);
+                VersionedTVar::new(SizeHeader::new(3), &TVAR1_ARRAY_INIT);
             pub static ref TVAR2: VersionedTVar<SizeHeader, u64> =
-                VersionedTVar::new
-                    (SizeHeader::new(6), vec![7, 8, 9, 10, 11, 12]);
-
+                VersionedTVar::new(SizeHeader::new(6), &TVAR2_ARRAY_INIT);
         }
     }
 
@@ -2903,9 +2902,10 @@ mod tests {
 
         impl<T: Copy + Ord + Default + 'static> SortedVec<T> {
             pub fn new() -> SortedVec<T> {
+                let empty_init = [ ];
                 SortedVec {
                     0: VersionedTVar::new_shared
-                        (SortedVecHeader::new(0), vec![])
+                        (SortedVecHeader::new(0), &empty_init)
                 }
             }
 
@@ -3046,9 +3046,10 @@ mod tests {
             pool.execute(|| {
                 VersionedTransaction::start_txn(|txn| {
                     let mut tvar_capture = txn.capture_tvar(&TVAR)?;
+                    let trailing_array_init =
+                        [0, 4, 8, 12, 16, 20, 24, 28, 32, 36];
                     tvar_capture.fill_if_empty
-                        (SizeHeader { size: 10 },
-                            vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 36]);
+                        (SizeHeader { size: 10 }, &trailing_array_init);
                     for array_item in
                         tvar_capture
                             .get_captured_tvar_mut()
@@ -3090,12 +3091,11 @@ mod tests {
         use test10_state::TVAR;
         VersionedTransaction::start_txn(|txn| {
             let mut tvar_capture = txn.capture_tvar(&TVAR)?;
+            let trailing_array_init = [0, 4, 8, 12, 16, 20, 24, 28, 32, 36];
             tvar_capture.assert_empty_and_fill
-                (SizeHeader { size: 10 },
-                    vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 36]);
+                (SizeHeader { size: 10 }, &trailing_array_init);
              tvar_capture.assert_empty_and_fill
-                (SizeHeader { size: 10 },
-                    vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 36]);
+                (SizeHeader { size: 10 }, &trailing_array_init);
             Ok(())
         });
     }
@@ -3112,9 +3112,10 @@ mod tests {
                 VersionedTransaction::start_txn(|txn| {
                     let mut tvar_capture =
                         txn.capture_tvar_ref(&per_thread_tvar_ref)?;
+                    let trailing_array_init =
+                        [0, 4, 8, 12, 16, 20, 24, 28, 32, 36];
                     tvar_capture.fill_if_empty
-                        (SizeHeader { size: 10 },
-                            vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 36]);
+                        (SizeHeader { size: 10 }, &trailing_array_init);
                     for array_item in
                         tvar_capture
                             .get_captured_tvar_mut()
